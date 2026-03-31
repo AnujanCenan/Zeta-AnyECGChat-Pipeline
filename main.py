@@ -202,6 +202,7 @@ def change_arg(cls, args):
     """
     if cls in DATASET_CONFIG:
         config = DATASET_CONFIG[cls]
+        args.dataset = cls
         args.dataset_name = config["dataset_name"]
         args.dataset_path = config["dataset_path"]
         args.test_csv_path = config["test_csv_path"]
