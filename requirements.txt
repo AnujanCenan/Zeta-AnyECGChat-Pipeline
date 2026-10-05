@@ -1,0 +1,110 @@
+# requirements.txt
+#
+# For a Python 3.11 venv running the combined ZETA + anyECG-chat pipeline
+# (ecg_preprocessing.py, zeta_classify.py, localize_finding.py,
+# crop_and_recheck.py, run_pipeline.py).
+#
+# Compiled by cross-checking actual `import`/`from` statements in both
+# repos' source (not just their own requirements.txt, which turned out to
+# be missing several real dependencies -- see notes below) plus real
+# published version combinations for the packages neither repo pins.
+#
+# Install with: pip install -r requirements.txt
+
+# --- Pinned by anyECG-chat's own requirements.txt, confirmed still needed ---
+numpy==2.2.0
+pandas==2.2.3
+scikit-learn==1.6.0        # imported by BOTH anyECG-chat (inference.py) and ZETA (main.py, roc_auc_score)
+torch==2.5.1
+torchvision==0.20.1        # matching torch 2.5.1 release; not directly imported by our pipeline's code
+                            # path, kept for parity with anyECG-chat's official pins in case other
+                            # anyECG-chat code paths you run later depend on it transitively
+tqdm==4.67.1
+transformers==4.50.0        # NOT anyECG-chat's own pin (4.48.0) -- bumped because ZETA's
+                             # models/cross_layer.py imports apply_chunking_to_forward,
+                             # find_pruneable_heads_and_indices, and prune_linear_layer from
+                             # transformers.modeling_utils, which stopped re-exporting these at
+                             # transformers>=4.47 (confirmed via a public HF GitHub PR fixing the
+                             # identical break in a different codebase, LLaVA-OneVision). This means
+                             # 4.48.0 needs the same fix as any version here, and 4.50.0 is the
+                             # specific combination already confirmed working (with the source patch
+                             # below applied) on Python 3.11. See REQUIRED SOURCE PATCHES below.
+wfdb==4.1.2
+
+# --- Actually imported by anyECG-chat's code but MISSING from its own
+#     requirements.txt -- confirmed by grepping every import statement in
+#     the repo, not assumed ---
+einops==0.8.0               # anyecg/ecgvit.py: rearrange/repeat/pack/unpack -- the ECG ViT patchify logic
+peft==0.14.0                 # anyecg/ecg_language_modeling.py: LoraConfig -- the Stage 3 LoRA adapter
+scipy==1.14.1                 # anyecg/utils.py, anyecg/dataset.py: scipy.signal.resample
+accelerate==1.3.0            # required by AutoModelForCausalLM.from_pretrained(..., device_map="auto")
+                              # in ecg_language_modeling.py -- raises an error at model load without
+                              # this installed, even though it's never explicitly imported by name
+
+# --- ZETA-specific, not covered above ---
+omegaconf==2.3.0             # models/base.py: DictConfig, used by ZETA's own config handling
+
+# =============================================================================
+# REQUIRED SOURCE PATCHES (not pip-installable -- these are edits to the
+# vendored repo code itself, needed regardless of which package versions
+# above you use, since the root cause is an internal transformers API that
+# moved, not a missing package)
+# =============================================================================
+# 1. anyecg/ecg_language_modeling.py: ECG_Language_Model.__init__ hardcodes
+#    two absolute paths specific to the original authors' machine
+#    (/mnt/sda1/xxxx/... and /home/xxxx/...). Patch it to accept
+#    `ecg_encoder_ckpt_path` and `llm_model_id` as constructor parameters
+#    (with those same strings kept as defaults, for backward compatibility
+#    with anyECG-chat's own train.py/inference.py call sites).
+#
+# 2. models/cross_layer.py (ZETA): change
+#        from transformers.modeling_utils import (
+#            apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer)
+#    to
+#        from transformers.pytorch_utils import (
+#            apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer)
+#    Root cause: these three functions stopped being re-exported from
+#    transformers.modeling_utils starting at transformers>=4.47 -- confirmed
+#    via a public transformers-ecosystem GitHub PR fixing the identical
+#    ImportError in a different project. This affects every transformers
+#    version pinned above (4.48+), not just newer ones.
+#
+# If you hit a similar ImportError elsewhere in ZETA's models/cmelt.py
+# (which imports T5EncoderModel, BertConfig, BertPredictionHeadTransform
+# directly from transformers' internal model files) -- these are more
+# stable, commonly-copied public classes and I have no evidence they've
+# moved, but this has NOT been independently confirmed against transformers
+# 4.50.0 specifically. If one of these does fail to import, it's the same
+# category of fix: check the error for where the symbol now lives.
+# =============================================================================
+
+# --- Our own pipeline scripts (ecg_preprocessing.py, zeta_classify.py, etc.) ---
+# No additional packages beyond the above -- they only use numpy, scipy, wfdb,
+# torch, and Python's standard library (dataclasses, typing, json, random, pathlib).
+
+# =============================================================================
+# OPTIONAL: only needed if you also run anyECG-chat's OWN evaluation/training
+# scripts directly (train.py, inference.py, mimic_multi_evaluate.py) -- e.g.
+# for reproducing its baseline IoU/AUC numbers, per your Week 1 plan. Not
+# needed for run_pipeline.py itself. Uncomment as needed rather than
+# installing all of these speculatively.
+# =============================================================================
+datasets==3.2.0             # train.py, inference.py: load_dataset
+sentence-transformers        # inference.py: BioBERT-style embedding similarity scoring for ReportGen
+rouge                        # inference.py: ROUGE scoring
+nltk                         # inference.py: BLEU scoring (also requires nltk.download('punkt') once)
+requests                     # inference.py: HTTP calls to PULSE/LLaVA-Med baseline servers
+ecg_plot                     # inference.py: rendering ECG images for baseline model comparison
+openai                       # mimic_multi_evaluate.py: OpenAI-compatible client for the QwQ-32B judge
+
+# =============================================================================
+# Present in anyECG-chat's official requirements.txt but NOT imported
+# anywhere in the released code (confirmed by grep) -- likely leftover from
+# a broader private codebase. Not needed for anything in this repo as
+# released. Uncomment only if you want exact parity with their pinned
+# environment regardless.
+# =============================================================================
+# torchio==0.20.3
+# torchmetrics==1.6.1
+# rotary-embedding-torch==0.8.6
+# scikit-image==0.25.0
