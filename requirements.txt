@@ -79,8 +79,10 @@ omegaconf==2.3.0             # models/base.py: DictConfig, used by ZETA's own co
 # =============================================================================
 
 # --- Our own pipeline scripts (ecg_preprocessing.py, zeta_classify.py, etc.) ---
-# No additional packages beyond the above -- they only use numpy, scipy, wfdb,
-# torch, and Python's standard library (dataclasses, typing, json, random, pathlib).
+python-dotenv==1.0.1          # run_pipeline.py: load_dotenv() for .env-based path configuration
+# Otherwise no additional packages beyond the above -- they only use numpy,
+# scipy, wfdb, torch, and Python's standard library (dataclasses, typing,
+# json, random, pathlib).
 
 # =============================================================================
 # OPTIONAL: only needed if you also run anyECG-chat's OWN evaluation/training
@@ -89,13 +91,13 @@ omegaconf==2.3.0             # models/base.py: DictConfig, used by ZETA's own co
 # needed for run_pipeline.py itself. Uncomment as needed rather than
 # installing all of these speculatively.
 # =============================================================================
-datasets==3.2.0             # train.py, inference.py: load_dataset
-sentence-transformers        # inference.py: BioBERT-style embedding similarity scoring for ReportGen
-rouge                        # inference.py: ROUGE scoring
-nltk                         # inference.py: BLEU scoring (also requires nltk.download('punkt') once)
-requests                     # inference.py: HTTP calls to PULSE/LLaVA-Med baseline servers
-ecg_plot                     # inference.py: rendering ECG images for baseline model comparison
-openai                       # mimic_multi_evaluate.py: OpenAI-compatible client for the QwQ-32B judge
+# datasets==3.2.0             # train.py, inference.py: load_dataset
+# sentence-transformers        # inference.py: BioBERT-style embedding similarity scoring for ReportGen
+# rouge                        # inference.py: ROUGE scoring
+# nltk                         # inference.py: BLEU scoring (also requires nltk.download('punkt') once)
+# requests                     # inference.py: HTTP calls to PULSE/LLaVA-Med baseline servers
+# ecg_plot                     # inference.py: rendering ECG images for baseline model comparison
+# openai                       # mimic_multi_evaluate.py: OpenAI-compatible client for the QwQ-32B judge
 
 # =============================================================================
 # Present in anyECG-chat's official requirements.txt but NOT imported

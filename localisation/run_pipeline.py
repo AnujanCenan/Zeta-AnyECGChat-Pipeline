@@ -32,6 +32,14 @@ Usage (batch, one WFDB record path per line in a text file):
         --records-file records.txt \\
         --output results.json
 
+Configuration via .env: copy .env.example to .env (same directory as this
+script) and fill in your paths -- repo locations and checkpoint paths no
+longer need to be retyped on every invocation. A value given explicitly on
+the command line always overrides the corresponding .env value; .env only
+supplies what you didn't type. --record/--records-file and --output are
+deliberately NOT sourced from .env, since those naturally vary per run
+rather than being "set up once" paths.
+
 See --help for every option, or the argument definitions below for what
 each one is doing and why it exists.
 """
@@ -45,7 +53,22 @@ import os
 import random
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
+
+from dotenv import load_dotenv
+
+# Anchored to this script's own directory, not the current working
+# directory -- important because we later os.chdir() into --zeta-repo, and
+# because the user may invoke this script from anywhere (e.g. a PBS job
+# script's $PBS_O_WORKDIR could differ from where run_pipeline.py lives).
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
+
+def _env_path(name: str) -> Optional[str]:
+    """Reads an environment variable (from .env or the shell) as a string,
+    or None if unset -- used as argparse `default=` so CLI flags still
+    override whatever .env provided."""
+    return os.environ.get(name)
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,18 +78,26 @@ def parse_args() -> argparse.Namespace:
     )
 
     # --- repo locations (own sys.path / CWD setup, see module docstring) ---
-    p.add_argument("--zeta-repo", required=True, type=Path,
-                    help="Path to the ZETA repo root (contains main.py, configs/, checkpoints/).")
-    p.add_argument("--anyecg-repo", required=True, type=Path,
-                    help="Path to the anyECG-chat-main repo root (contains anyecg/ package).")
+    # required=False here (not argparse's required=True) because these can
+    # come from .env instead -- genuinely-missing values are caught in the
+    # validation step after parsing, with a clear error naming both the
+    # flag and the .env variable that can supply it.
+    p.add_argument("--zeta-repo", type=Path, default=_env_path("ZETA_REPO"),
+                    help="Path to the ZETA repo root (contains main.py, configs/, checkpoints/). "
+                         "Falls back to $ZETA_REPO from .env if not given.")
+    p.add_argument("--anyecg-repo", type=Path, default=_env_path("ANYECG_REPO"),
+                    help="Path to the anyECG-chat-main repo root (contains anyecg/ package). "
+                         "Falls back to $ANYECG_REPO from .env if not given.")
     p.add_argument("--pipeline-code-dir", type=Path, default=Path(__file__).resolve().parent,
                     help="Directory containing ecg_preprocessing.py, zeta_classify.py, "
                          "localize_finding.py, crop_and_recheck.py (defaults to this script's directory).")
 
     # --- ZETA checkpoint / config ---
-    p.add_argument("--observations-path", type=str, default="configs/observations.json",
+    p.add_argument("--observations-path", type=str,
+                    default=_env_path("OBSERVATIONS_PATH") or "configs/observations.json",
                     help="Path to ZETA's observation bank, relative to --zeta-repo "
-                         "(ZETA's own load_encoders() also expects to run with CWD == zeta-repo).")
+                         "(ZETA's own load_encoders() also expects to run with CWD == zeta-repo). "
+                         "Falls back to $OBSERVATIONS_PATH from .env, then this relative default.")
     p.add_argument("--conditions", type=str, default="VPC,LBBB,RBBB,NORM",
                     help="Comma-separated ZETA condition keys to classify against. Must include "
                          "at least VPC/LBBB/RBBB (the only conditions with a confirmed anyECG-chat "
@@ -74,23 +105,28 @@ def parse_args() -> argparse.Namespace:
                          "comparison to be meaningful.")
 
     # --- anyECG-chat checkpoints ---
-    p.add_argument("--projection-ckpt", required=True, type=Path,
-                    help="Path to the Stage 3 projection.pth checkpoint.")
-    p.add_argument("--ecg-model-ckpt", type=Path, default=None,
+    p.add_argument("--projection-ckpt", type=Path, default=_env_path("PROJECTION_CKPT"),
+                    help="Path to the Stage 3 projection.pth checkpoint. "
+                         "Falls back to $PROJECTION_CKPT from .env if not given.")
+    p.add_argument("--ecg-model-ckpt", type=Path, default=_env_path("ECG_MODEL_CKPT"),
                     help="Path to the Stage 3 ecg_model.pth checkpoint. Strongly recommended -- "
-                         "omitting it falls back to the Stage 0 CLEP-pretrained encoder only.")
-    p.add_argument("--lora-ckpt", type=Path, default=None,
+                         "omitting it falls back to the Stage 0 CLEP-pretrained encoder only. "
+                         "Falls back to $ECG_MODEL_CKPT from .env if not given.")
+    p.add_argument("--lora-ckpt", type=Path, default=_env_path("LORA_CKPT"),
                     help="Path to the DIRECTORY containing adapter_config.json + "
                          "adapter_model.safetensors (typically the same stage3_ckpt/ folder as "
                          "the two checkpoints above). Strongly recommended -- omitting it leaves "
-                         "the LLM at untuned base Llama-3-8B-Instruct.")
-    p.add_argument("--ecg-encoder-ckpt", type=Path, default=None,
+                         "the LLM at untuned base Llama-3-8B-Instruct. "
+                         "Falls back to $LORA_CKPT from .env if not given.")
+    p.add_argument("--ecg-encoder-ckpt", type=Path, default=_env_path("ECG_ENCODER_CKPT"),
                     help="Path to the Stage 0 CLEP-pretrained encoder (vit_base_sigmoid/model_epoch9.bin). "
                          "Only needed if you have NOT patched ECG_Language_Model.__init__'s default "
-                         "to point here already; passed through as ecg_encoder_ckpt_path.")
-    p.add_argument("--llm-model-id", type=str, default=None,
+                         "to point here already; passed through as ecg_encoder_ckpt_path. "
+                         "Falls back to $ECG_ENCODER_CKPT from .env if not given.")
+    p.add_argument("--llm-model-id", type=str, default=_env_path("LLM_MODEL_ID"),
                     help="Local path or HF hub id for Meta-Llama-3-8B-Instruct. Only needed if you "
-                         "have NOT patched ECG_Language_Model.__init__'s default already.")
+                         "have NOT patched ECG_Language_Model.__init__'s default already. "
+                         "Falls back to $LLM_MODEL_ID from .env if not given.")
 
     # --- pipeline behavior ---
     p.add_argument("--record", type=str, default=None,
@@ -130,6 +166,19 @@ def parse_args() -> argparse.Namespace:
                          "--zeta-repo.")
 
     args = p.parse_args()
+
+    # Values that used to be argparse's required=True, now validated here
+    # instead since they can come from .env -- each error names both the
+    # CLI flag and the .env variable that can supply it, since a missing
+    # value could be missing from either source.
+    required = {
+        "--zeta-repo": ("ZETA_REPO", args.zeta_repo),
+        "--anyecg-repo": ("ANYECG_REPO", args.anyecg_repo),
+        "--projection-ckpt": ("PROJECTION_CKPT", args.projection_ckpt),
+    }
+    missing = [f"{flag} (or set {env_var} in .env)" for flag, (env_var, value) in required.items() if value is None]
+    if missing:
+        p.error("Missing required value(s): " + "; ".join(missing))
 
     if bool(args.record) == bool(args.records_file):
         p.error("Provide exactly one of --record or --records-file.")
@@ -179,7 +228,7 @@ def main() -> None:
 
     from ecg_preprocessing import ECGPreprocessor
     from zeta_classify import ZetaZeroShotClassifier
-    from localise_finding import (
+    from localize_finding import (
         load_anyecg_model,
         localize_top_finding,
         localize_both_variants,
