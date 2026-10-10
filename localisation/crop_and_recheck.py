@@ -40,7 +40,7 @@ from scipy import stats
 
 from localisation.ecg_preprocessing import ECGPreprocessor
 from localisation.zeta_classify import ZetaZeroShotClassifier
-from localise_finding import LocalizedFinding
+from localisation.localize_finding import LocalizedFinding
 
 
 @dataclass
@@ -233,7 +233,7 @@ def summarize_recheck_results(results: List[Optional[CropRecheckResult]]) -> dic
 
 
 if __name__ == "__main__":
-    from localise_finding import localize_top_finding, load_anyecg_model, CONDITION_NAME_MAP
+    from localisation.localize_finding import localize_top_finding, load_anyecg_model, CONDITION_NAME_MAP
 
     preprocessor = ECGPreprocessor()
     zeta_clf = ZetaZeroShotClassifier(conditions=list(CONDITION_NAME_MAP.keys()) + ["NORM"])
