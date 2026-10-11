@@ -125,7 +125,7 @@ def load_anyecg_model(
               "will likely be degraded.")
 
     if lora_ckpt is not None:
-        model.language_model.load_adapter(lora_ckpt)
+        model.language_model.load_adapter(lora_ckpt, adapter_name="My_Cool_Adapter")
         print(f"Loaded LoRA adapter: {lora_ckpt}")
     else:
         print("WARNING: no lora_ckpt provided -- the LLM's attention layers are "
