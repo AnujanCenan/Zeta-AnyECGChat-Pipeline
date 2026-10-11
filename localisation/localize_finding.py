@@ -105,9 +105,11 @@ def load_anyecg_model(
     """
     kwargs = {"use_lora": use_lora}
     if ecg_encoder_ckpt_path is not None:
-        kwargs["ecg_encoder_ckpt_path"] = ecg_encoder_ckpt_path
+        # kwargs["ecg_encoder_ckpt_path"] = ecg_encoder_ckpt_path
+        pass
     if llm_model_id is not None:
-        kwargs["llm_model_id"] = llm_model_id
+        # kwargs["llm_model_id"] = llm_model_id
+        pass
 
     model = ECG_Language_Model(**kwargs).cuda()
 
