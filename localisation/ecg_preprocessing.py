@@ -278,6 +278,23 @@ class ECGPreprocessor:
         signal = self._normalize_per_lead_pm1(signal)
         return signal.T.astype(np.float32)  # (12, T)
 
+    def load_for_display(self, record_path: str) -> LoadedRecord:
+        """
+        Public accessor to the raw, unnormalized signal at native sampling
+        rate, in standard 12-lead order -- i.e. exactly what `_load_record`
+        already produces, just exposed outside the class.
+
+        This is for PLOTTING only (see `ecg_visualization.py`). Don't feed
+        its output to ZETA or anyECG-chat: it is neither resampled nor
+        normalized, so it won't match either model's expected input
+        range/scale. `to_zeta_input`/`to_anyecg_input` remain the only
+        correct paths for model input -- this method exists because their
+        normalized/resampled outputs (global [0,1] or per-lead [-1,1]) are
+        not clinically interpretable amplitude-wise, which matters for a
+        human-readable overlay but not for a model's forward pass.
+        """
+        return self._load_record(record_path)
+
     def preprocess_both(
         self,
         record_path: str,
