@@ -7,13 +7,21 @@ Command-line entrypoint for the full "why + where" pipeline:
               -> anyECG-chat (where: localized span), baseline and/or enriched prompt
               -> crop-and-recheck (does the localized span actually contain
                  more of the claimed evidence than a matched control window?)
+              -> ecg_visualization (overlay PNG of the ECG with the localized
+                 span -- and the recheck's control window, if computed --
+                 shaded on the waveform)
 
 This script owns all repo-path / sys.path / working-directory setup, based
 on command-line arguments -- the library modules (`ecg_preprocessing.py`,
-`zeta_classify.py`, `localize_finding.py`, `crop_and_recheck.py`) assume
-that's already been done by the time they're imported, rather than
-hardcoding paths themselves. That's why the sys.path inserts and `os.chdir`
-below happen BEFORE any of those modules are imported.
+`zeta_classify.py`, `localize_finding.py`, `crop_and_recheck.py`,
+`ecg_visualization.py`) assume that's already been done by the time they're
+imported, rather than hardcoding paths themselves. That's why the sys.path
+inserts and `os.chdir` below happen BEFORE any of those modules are
+imported.
+
+Overlay generation is ON by default (one PNG per record/variant that
+anyECG-chat actually returned a span for -- see --skip-overlays to turn it
+off, e.g. for a fast smoke test where you only care about the JSON output).
 
 Usage (single record):
     python run_pipeline.py \\
@@ -158,6 +166,20 @@ def parse_args() -> argparse.Namespace:
                     help="Skip the crop-and-recheck validation step, running only ZETA + "
                          "anyECG-chat localization (e.g. for a quick smoke test).")
 
+    # --- visualization ---
+    p.add_argument("--skip-overlays", action="store_true",
+                    help="Skip generating the ECG localization overlay PNGs (ecg_visualization.py). "
+                         "On by default -- one PNG is saved per record/variant that anyECG-chat "
+                         "actually returned a span for (nothing is saved for a 'Not Found' answer, "
+                         "since there's no interval to shade).")
+    p.add_argument("--overlay-dir", type=Path, default=None,
+                    help="Directory to save overlay PNGs into. Defaults to '<output-stem>_overlays' "
+                         "next to --output if not given.")
+    p.add_argument("--overlay-seconds-to-plot", type=float, default=None,
+                    help="How much of each record (in seconds) the overlay plots. Defaults to "
+                         "--crop-seconds -- i.e. the same window anyECG-chat actually searched, so "
+                         "the plotted trace matches what the model saw.")
+
     # --- output ---
     p.add_argument("--output", type=Path, required=True,
                     help="Path to write the JSON results file. Resolved to an absolute path "
@@ -217,6 +239,13 @@ def main() -> None:
     output_path = args.output.resolve()
     records = load_record_list(args)
 
+    # Same "resolve before chdir" reasoning as --output: a relative
+    # --overlay-dir should land next to where the user ran the script, not
+    # inside --zeta-repo.
+    overlay_dir = (args.overlay_dir or output_path.parent / f"{output_path.stem}_overlays").resolve()
+    if not args.skip_overlays:
+        overlay_dir.mkdir(parents=True, exist_ok=True)
+
     # --- Own all sys.path / CWD setup here, before importing pipeline code ---
     sys.path.insert(0, str(args.pipeline_code_dir.resolve()))
     sys.path.insert(0, str(args.zeta_repo.resolve()))
@@ -235,6 +264,8 @@ def main() -> None:
         CONDITION_NAME_MAP,
     )
     from crop_and_recheck import run_crop_and_recheck, summarize_recheck_results
+    from ecg_visualization import plot_localization_overlay
+    import matplotlib.pyplot as plt  # noqa: E402 -- Agg backend already set by ecg_visualization's import
 
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     unmapped_required = [c for c in CONDITION_NAME_MAP if c not in conditions]
@@ -266,7 +297,7 @@ def main() -> None:
 
     for i, record_path in enumerate(records):
         print(f"\n[{i + 1}/{len(records)}] {record_path}")
-        record_result = {"record_path": record_path, "findings": {}, "recheck": {}, "error": None}
+        record_result = {"record_path": record_path, "findings": {}, "recheck": {}, "overlays": {}, "error": None}
 
         try:
             if args.prompt_variant == "both":
@@ -286,6 +317,7 @@ def main() -> None:
                 print(f"  [{variant}] condition={finding.condition}  "
                       f"where={finding.where_raw!r}")
 
+                recheck = None
                 if not args.skip_recheck:
                     recheck = run_crop_and_recheck(
                         finding, zeta_clf, preprocessor,
@@ -299,6 +331,31 @@ def main() -> None:
                     if recheck is not None:
                         print(f"  [{variant}] recheck: localized={recheck.localized_score:.3f} "
                               f"control={recheck.control_score} diff={recheck.score_difference}")
+
+                # Overlay generation: skipped entirely for a "Not Found" /
+                # unparseable answer (finding.where_intervals is empty/None)
+                # -- there's no interval to shade, so plot_localization_overlay
+                # would just produce a plain trace with no annotation. That's
+                # a meaningful outcome (see crop_and_recheck's no_localization
+                # bucket) but not one worth a PNG per record.
+                if not args.skip_overlays and finding.where_intervals:
+                    overlay_path = overlay_dir / f"{Path(record_path).name}_{finding.condition}_{variant}.png"
+                    try:
+                        fig = plot_localization_overlay(
+                            record_path, finding,
+                            preprocessor=preprocessor,
+                            crop_result=recheck,
+                            seconds_to_plot=args.overlay_seconds_to_plot or args.crop_seconds,
+                            output_path=str(overlay_path),
+                        )
+                        plt.close(fig)
+                        record_result["overlays"][variant] = str(overlay_path)
+                        print(f"  [{variant}] overlay: {overlay_path}")
+                    except Exception as e:  # noqa: BLE001 -- a plotting failure shouldn't drop an
+                                             # otherwise-successful classification/localization result
+                        record_result["overlays"][variant] = None
+                        print(f"  [{variant}] WARNING: overlay generation failed: "
+                              f"{type(e).__name__}: {e}")
 
         except Exception as e:  # noqa: BLE001 -- deliberately broad: one bad record shouldn't kill a batch run
             record_result["error"] = f"{type(e).__name__}: {e}"
@@ -321,6 +378,8 @@ def main() -> None:
         json.dump(output, f, indent=2, default=str)
 
     print(f"\nWrote results for {len(records)} record(s) to {output_path}")
+    if not args.skip_overlays:
+        print(f"Overlay PNGs (where generated): {overlay_dir}")
     if summary:
         print("Summary:")
         print(json.dumps(summary, indent=2, default=str))
