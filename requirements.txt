@@ -80,6 +80,9 @@ omegaconf==2.3.0             # models/base.py: DictConfig, used by ZETA's own co
 
 # --- Our own pipeline scripts (ecg_preprocessing.py, zeta_classify.py, etc.) ---
 python-dotenv==1.0.1          # run_pipeline.py: load_dotenv() for .env-based path configuration
+matplotlib==3.9.2             # ecg_visualization.py: renders the localization overlay PNGs.
+                               # Uses the "Agg" backend explicitly (set before pyplot is imported)
+                               # so this also runs headless on a Katana compute node with no display.
 # Otherwise no additional packages beyond the above -- they only use numpy,
 # scipy, wfdb, torch, and Python's standard library (dataclasses, typing,
 # json, random, pathlib).
