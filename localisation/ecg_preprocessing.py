@@ -53,8 +53,17 @@ STANDARD_LEAD_ORDER: Sequence[str] = (
 @dataclass
 class LoadedRecord:
     """Raw signal + metadata straight off disk, before any format-specific step."""
-    signal: np.ndarray   # shape (T_native, 12), canonical lead order, zero-padded if needed
-    fs: float            # native sampling frequency (Hz)
+    signal: np.ndarray            # shape (T_native, 12), canonical lead order, zero-padded if needed
+    fs: float                     # native sampling frequency (Hz)
+    leads_recorded: np.ndarray    # shape (12,) bool, aligned to STANDARD_LEAD_ORDER -- True where
+                                   # this lead was actually present in the source WFDB record,
+                                   # False where it's zero-padding introduced by _load_record
+                                   # (e.g. 10 of 12 leads for a 2-channel MIT-BIH Holter record).
+                                   # See ECGPreprocessor._normalize_global_01_masked for why this
+                                   # distinction matters: a naive global min/max normalization
+                                   # over an already-padded array maps "no lead recorded" to a
+                                   # nonzero constant plateau, not to 0 -- a real bug found and
+                                   # fixed in this session (see diagnose_padding_and_adapter.py).
 
 
 class ECGPreprocessor:
@@ -91,6 +100,7 @@ class ECGPreprocessor:
         signal, meta = wfdb.rdsamp(record_path)  # signal: (T, n_sig)
         fs = float(meta["fs"])
         leads_present = [self._rename_lead(name) for name in meta["sig_name"]]
+        recorded_leads = set(leads_present)  # snapshot BEFORE any padding is added below
 
         n_sig = signal.shape[1]
         if n_sig < 12:
@@ -100,6 +110,7 @@ class ECGPreprocessor:
                 leads_present = ["mlii", "v1"]
             elif leads_present == ["ecg"]:
                 leads_present = ["i"]
+            recorded_leads = set(leads_present)  # re-snapshot after the MIT-BIH-style rename
             missing = [l for l in self.standard_lead_order if l not in leads_present]
             signal = np.concatenate(
                 [signal, np.zeros((signal.shape[0], len(missing)), dtype=signal.dtype)],
@@ -111,7 +122,11 @@ class ECGPreprocessor:
             reorder_idx = [leads_present.index(l) for l in self.standard_lead_order]
             signal = signal[:, reorder_idx]
 
-        return LoadedRecord(signal=signal, fs=fs)
+        leads_recorded = np.array(
+            [lead in recorded_leads for lead in self.standard_lead_order], dtype=bool
+        )
+
+        return LoadedRecord(signal=signal, fs=fs, leads_recorded=leads_recorded)
 
     @staticmethod
     def _rename_lead(name: str) -> str:
@@ -167,6 +182,48 @@ class ECGPreprocessor:
         return np.nan_to_num(normed, nan=0.0)
 
     @staticmethod
+    def _normalize_global_01_masked(signal: np.ndarray, leads_recorded: np.ndarray) -> np.ndarray:
+        """
+        Like `_normalize_global_01`, but for records where some leads are
+        zero-padding rather than real data (`leads_recorded[i] == False`).
+
+        BUG THIS FIXES: `_normalize_global_01` computes a single min/max
+        over the WHOLE (T, 12) array, including padded columns that are
+        all exactly 0 in raw units. Since real ECG signal has both positive
+        and negative excursions, the array's global min is < 0, so 0 does
+        NOT map to 0 under (x - lo) / (hi - lo) -- it maps to a nonzero
+        constant (`-lo / (hi - lo)`, typically ~0.2-0.3). For a record
+        missing 10 of 12 leads (e.g. a 2-channel MIT-BIH Holter record with
+        only MLII/V1 recorded), this turns "no lead here" into a flat,
+        nonzero plateau repeated identically across every such record --
+        an artificial, out-of-distribution pattern ZETA's encoder was
+        never trained on (it was pretrained on genuine multi-lead MIMIC-ECG
+        data), and which empirically correlates with a systematic
+        misclassification (confirmed in this session: every reduced-lead
+        MIT-BIH RBBB record was classified as LBBB). anyECG-chat's own
+        per-lead [-1,1] normalization does NOT have this problem -- a
+        zero column there hits 0/0 -> NaN -> nan_to_num(0.0), landing
+        exactly on 0.
+
+        Fix: compute the global min/max from ONLY the recorded (non-padded)
+        leads, normalize the whole array with that, then explicitly zero
+        out the padded lead columns afterward -- matching anyECG-chat's
+        "padding means silence" convention instead of accidentally encoding
+        it as a mid-range signal value.
+
+        No-op (identical to `_normalize_global_01`) when every lead is
+        recorded, so this is always safe to call.
+        """
+        if np.all(leads_recorded):
+            return ECGPreprocessor._normalize_global_01(signal)
+
+        real_signal = signal[:, leads_recorded]
+        lo, hi = np.min(real_signal), np.max(real_signal)
+        normed = (signal - lo) / (hi - lo + 1e-8)
+        normed[:, ~leads_recorded] = 0.0
+        return normed
+
+    @staticmethod
     def _apply_mimic_lead_swap(signal: np.ndarray) -> np.ndarray:
         """
         ZETA-specific quirk: its underlying model was pretrained on MIMIC-ECG,
@@ -205,7 +262,7 @@ class ECGPreprocessor:
         rec = self._load_record(record_path)
         signal = self._resample(rec.signal, rec.fs, target_fs)
         signal = self._crop_or_pad(signal, int(round(crop_seconds * target_fs)))
-        signal = self._normalize_global_01(signal)
+        signal = self._normalize_global_01_masked(signal, rec.leads_recorded)
         if apply_mimic_lead_swap:
             signal = self._apply_mimic_lead_swap(signal)
         return signal.T.astype(np.float32)  # (12, T)
@@ -244,7 +301,7 @@ class ECGPreprocessor:
         end_idx = int(round(end_seconds * target_fs))
         window = resampled[start_idx:end_idx]
         window = self._crop_or_pad(window, int(round(pad_to_seconds * target_fs)))
-        window = self._normalize_global_01(window)
+        window = self._normalize_global_01_masked(window, rec.leads_recorded)
         if apply_mimic_lead_swap:
             window = self._apply_mimic_lead_swap(window)
         return window.T.astype(np.float32)  # (12, T)
