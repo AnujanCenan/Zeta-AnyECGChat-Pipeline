@@ -136,28 +136,58 @@ def main():
     messages = [[{"role": "user", "content": question}]]
     ecgs = [torch.tensor(anyecg_input, dtype=torch.float32)]
 
-    answer_with_adapter = model.ecg_chat(ecgs, messages)[0]
-    print(f"Answer WITH adapter enabled:    {answer_with_adapter!r}")
-
-    # peft's PeftModel exposes disable_adapter() as a context manager that
-    # temporarily runs the base model without any adapter applied.
+    # --- Which adapter(s) actually exist, and which is active? ---
+    # anyECG-chat's own ecg_language_modeling.py calls `model.add_adapter(peft_config)`
+    # directly on the AutoModelForCausalLM instance -- transformers' native PeftAdapterMixin,
+    # NOT peft.get_peft_model(). This means __init__(use_lora=True) ALREADY creates an
+    # untrained adapter (conventionally named "default") before load_anyecg_model() ever
+    # runs load_adapter(lora_ckpt). If that call loads the real Stage 3 weights under a
+    # DIFFERENT adapter name (e.g. your "Cool_Adapter" workaround) without also calling
+    # set_adapter(...) to make it active, generation keeps using the untrained "default"
+    # adapter -- no error anywhere, just silently wrong output. This block checks exactly that.
+    lm = model.language_model
     try:
-        with model.language_model.disable_adapter():
-            answer_without_adapter = model.ecg_chat(ecgs, messages)[0]
-        print(f"Answer WITH adapter DISABLED:   {answer_without_adapter!r}")
+        all_adapters = list(lm.peft_config.keys())
+    except AttributeError:
+        all_adapters = None
+    try:
+        active = lm.active_adapters()
+    except AttributeError:
+        active = None
+
+    print(f"All loaded adapter names: {all_adapters}")
+    print(f"Currently ACTIVE adapter(s) for generation: {active}")
+    if all_adapters and active and set(active) != set(all_adapters) - {None}:
+        print("*** More than one adapter is loaded, and the active one may not be the one "
+              "load_adapter() just loaded. If the active adapter isn't your Stage 3 checkpoint's "
+              "name, call model.language_model.set_adapter('<your adapter name>') after loading. ***")
+
+    answer_with_adapter = model.ecg_chat(ecgs, messages)[0]
+    print(f"\nAnswer WITH current active adapter: {answer_with_adapter!r}")
+
+    # transformers' PeftAdapterMixin exposes disable_adapters()/enable_adapters() as plain
+    # toggle methods (NOT a context manager, and NOT the same API as peft.PeftModel's
+    # disable_adapter() singular context manager -- that's the method name that raised
+    # AttributeError here, since anyECG-chat's language_model is not a peft.PeftModel).
+    try:
+        lm.disable_adapters()
+        answer_without_adapter = model.ecg_chat(ecgs, messages)[0]
+        lm.enable_adapters()
+        print(f"Answer with ALL adapters disabled:  {answer_without_adapter!r}")
 
         if answer_with_adapter.strip() == answer_without_adapter.strip():
-            print("\n*** IDENTICAL -- the LoRA adapter is NOT changing the model's output. ***")
-            print("This points to the adapter not actually being applied/loaded correctly --")
-            print("worth checking the Cool_Adapter naming / load_adapter() call on your Katana checkout.")
+            print("\n*** IDENTICAL -- whatever adapter is active isn't changing the output at all. ***")
+            print("Combined with the active-adapter check above, this points to either no adapter "
+                  "really being active, or the active one being the untrained 'default' from "
+                  "__init__ rather than your loaded Stage 3 weights.")
         else:
-            print("\nAnswers differ -- the adapter IS having an effect. Hypothesis 2 is less likely; "
-                  "the near-full-window answers are probably a genuine model behavior, not a "
-                  "loading bug. Worth re-examining prompt phrasing or checkpoint quality instead.")
-    except AttributeError:
-        print("model.language_model doesn't expose disable_adapter() -- it may not be a peft "
-              "PeftModel at this point (e.g. if use_lora=False was passed, or load_adapter() "
-              "failed silently). Check how the adapter was loaded.")
+            print("\nAnswers differ -- SOME adapter is having an effect. Check the active-adapter "
+                  "name printed above against the adapter name your Stage 3 checkpoint was loaded "
+                  "under -- if they don't match, you may be running the wrong (untrained) adapter.")
+    except AttributeError as e:
+        print(f"model.language_model doesn't expose disable_adapters()/enable_adapters(): {e}")
+        print("Check anyECG-chat's installed transformers version -- this is part of "
+              "PeftAdapterMixin and should be present whenever add_adapter()/load_adapter() are.")
 
 
 if __name__ == "__main__":
