@@ -25,7 +25,7 @@ Quick start
      python anyecg_playground.py --ecg /data/mitdb/100 --no-model   # test ECG load + plot only
 
 Interactive commands (type `help` inside the prompt):
-  load <record> [start_s [end_s]]   WFDB record base path (no extension), or .npy/.csv
+  load <record> [start_s [end_s]] [keep=ii,v1]   WFDB record base path (no extension), or .npy/.csv
   report                            generate the ECG report
   locate <name>                     pvc | lbbb | rbbb | pac | svpb | any free text
   ask <question>                    free-form question about the loaded ECG
@@ -269,7 +269,7 @@ def _slot_leads(sig: "object", names: Sequence[str]) -> Tuple["object", List[boo
 
 def load_ecg(spec: str, start_s: Optional[float], end_s: Optional[float], ecg_dir: Optional[str],
              fs: Optional[float] = None, leads: Optional[Sequence[str]] = None,
-             default_seconds: float = 10.0) -> LoadedECG:
+             default_seconds: float = 10.0, keep: Optional[Sequence[str]] = None) -> LoadedECG:
     import numpy as np
     from scipy.signal import resample
     from anyecg.utils import ecg_transform  # repo's own normaliser: per-lead min-max -> [-1, 1], NaN -> 0
@@ -317,6 +317,14 @@ def load_ecg(spec: str, start_s: Optional[float], end_s: Optional[float], ecg_di
         raise ValueError("Window is empty -- check start/end seconds against the record length.")
     sig12, present, n2 = _slot_leads(sig, names)
     notes += n2
+    if keep:  # emulate a reduced-lead ECG: zero every lead not listed (e.g. keep=ii,v1 ~ MIT-BIH layout)
+        k = {x.strip().lower() for x in keep}
+        for i, nm in enumerate(STD_LEADS):
+            if nm not in k:
+                sig12[:, i], present[i] = 0.0, False
+        if not any(present):
+            raise ValueError(f"keep={list(keep)} matches none of the recorded leads")
+        notes.append(f"kept only leads {sorted(k)}; all others zero-filled")
 
     n_out = int(sig12.shape[0] * MODEL_FS / source_fs)   # same rounding as the repo
     if source_fs != MODEL_FS:
@@ -539,9 +547,10 @@ class Session:
 
     # -- commands -------------------------------------------------------------------
     def load(self, spec: str, start: Optional[float] = None, end: Optional[float] = None,
-             fs: Optional[float] = None, leads: Optional[Sequence[str]] = None):
+             fs: Optional[float] = None, leads: Optional[Sequence[str]] = None,
+             keep: Optional[Sequence[str]] = None):
         self.ecg = load_ecg(spec, start, end, self.cfg.ecg_dir, fs=fs, leads=leads,
-                            default_seconds=self.default_seconds)
+                            default_seconds=self.default_seconds, keep=keep)
         self.info()
         for n in self.ecg.notes:
             print(f"  [note] {n}")
@@ -558,13 +567,22 @@ class Session:
         t0 = time.time()
         ans, n_in = self._generate(REPORT_QUESTION)
         print(f"\n  {ans}\n")
-        for i, f in enumerate(parse_report(ans), 1):
+        is_report = ans.lower().startswith("report:")
+        findings = parse_report(ans) if is_report else []
+        for i, f in enumerate(findings, 1):
             print(f"   {i:>2}. {f}")
         print(f"  [{time.time() - t0:.1f}s, prompt {n_in} tokens, T={self.temperature}]")
-        self._log("report", question=REPORT_QUESTION, answer=ans, findings=parse_report(ans))
+        if not is_report:
+            n_leads = sum(self._need_ecg().present)
+            print("  [warn] answer is not in 'Report: ...' format, so it is not a report. "
+                  + (f"Only {n_leads} of 12 leads are recorded here; the report task was trained on 12-lead MIMIC ECGs, "
+                     "while 2-lead MIT-BIH/ST-T ECGs were only seen in the localisation task. " if n_leads < 12 else "")
+                  + "Try a 12-lead ECG, `lora off`, `set temperature 0`, or re-run.")
+        self._log("report", question=REPORT_QUESTION, answer=ans, findings=findings, is_report_format=is_report)
 
     def locate(self, name: str):
         e = self._need_ecg()
+        name = name.strip().strip('"\'')   # tolerate: locate "atrial fibrillation"
         phrase, in_vocab = resolve_abnormality(name)
         if not in_vocab:
             print(f"  [warn] '{phrase}' is not one of the trained localisation targets "
@@ -585,6 +603,10 @@ class Session:
             print(f"  A {tag}{a}")
         print(f"  [{time.time() - t0:.1f}s, T={self.temperature}]")
         found = sum(1 for v in ivs_all if v)
+        odd = [a for a, v in zip(answers, ivs_all) if not v and "found" not in a.lower()]
+        if odd:
+            print(f"  [warn] {len(odd)}/{k} answer(s) are neither a 'Duration:' span nor 'No ... Found' "
+                  f"(e.g. {odd[0]!r}): the model did not treat this as a localisation request.")
         if k > 1:
             print(f"  {found}/{k} answers contained at least one interval")
         # intervals are relative to window start; clip to window
@@ -642,7 +664,8 @@ class Session:
 
 
 HELP = """\
-  load <record> [start_s [end_s]] [fs=500] [leads=i,ii]
+  load <record> [start_s [end_s]] [fs=500] [leads=i,ii] [keep=ii,v1]
+        keep=: zero all other leads (mimics the 2-lead training layout on a 12-lead ECG)
         WFDB record base path (no extension) or .npy/.csv (needs fs=). Relative names resolve against ECG_DIR.
         Default window = first --duration seconds (10). Up to 70 s; >10 s is processed as 10 s clips.
   report                       "Please provide the report for the following ECG."
@@ -684,7 +707,8 @@ def repl(sess: Session):
                 pos = [t for t in toks[1:] if "=" not in t]
                 sess.load(toks[0], float(pos[0]) if len(pos) > 0 else None, float(pos[1]) if len(pos) > 1 else None,
                           fs=float(kv["fs"]) if "fs" in kv else None,
-                          leads=kv["leads"].split(",") if "leads" in kv else None)
+                          leads=kv["leads"].split(",") if "leads" in kv else None,
+                          keep=kv["keep"].split(",") if "keep" in kv else None)
             elif cmd == "report":
                 sess.report()
             elif cmd == "locate":
@@ -727,6 +751,7 @@ def main():
     ap.add_argument("--duration", type=float, default=10.0, help="default window length in seconds (default 10)")
     ap.add_argument("--fs", type=float, help="sampling rate for .npy/.csv input")
     ap.add_argument("--leads", help="comma-separated lead names for each channel (override auto-detection)")
+    ap.add_argument("--keep", help="keep only these leads, zero the rest (e.g. ii,v1 to mimic 2-lead training data)")
     ap.add_argument("--report", action="store_true", help="generate a report for --ecg, then exit unless -i")
     ap.add_argument("--locate", metavar="NAME", help="localise NAME (pvc/lbbb/rbbb/pac/svpb/free text) in --ecg")
     ap.add_argument("--ask", metavar="QUESTION", help="ask a free-form question about --ecg")
@@ -777,7 +802,8 @@ def main():
     if args.ecg:
         try:
             sess.load(args.ecg, args.start, args.end, fs=args.fs,
-                      leads=args.leads.split(",") if args.leads else None)
+                      leads=args.leads.split(",") if args.leads else None,
+                      keep=args.keep.split(",") if args.keep else None)
         except Exception as e:  # noqa: BLE001
             sys.exit(f"[error] could not load ECG: {e}")
         if args.no_model:
