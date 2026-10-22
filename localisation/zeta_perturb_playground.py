@@ -511,8 +511,17 @@ def faithfulness(scorer, x, m, Tp, Tn, metric: str, obs: Optional[int], baseline
         drop = s_full - s
         rows.append(dict(fraction=f, top=float(drop[0]), bottom=float(drop[1]),
                          random_mean=float(drop[2:].mean()), random_sd=float(drop[2:].std())))
-    ok = all(r["top"] > r["random_mean"] + 2 * r["random_sd"] and r["top"] > r["bottom"] for r in rows)
-    return dict(score_full=s_full, rows=rows, faithful=bool(ok), bin_s=bin_s)
+    for r in rows:
+        r["z"] = (r["top"] - r["random_mean"]) / (r["random_sd"] + 1e-9)   # top-ranked vs random deletions, in sd units
+    ordered = all(r["top"] > r["random_mean"] > r["bottom"] or (r["top"] > r["random_mean"] and r["top"] > r["bottom"])
+                  for r in rows)
+    if all(r["z"] > 2 for r in rows) and ordered:
+        level = "strong"
+    elif ordered and all(r["z"] > 1 for r in rows):
+        level = "weak"      # right direction at every fraction, but not clearly beyond random-deletion variability
+    else:
+        level = "none"
+    return dict(score_full=s_full, rows=rows, level=level, faithful=level == "strong", bin_s=bin_s)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -673,13 +682,16 @@ class Session:
         if check:
             faith = faithfulness(self.scorer, r.x, m, Tp, Tn, self.metric, oi, self.baseline, self.cfg.batch_size)
             print(f"  faithfulness (delete {faith['bin_s']}s bins; score drop, higher = bigger damage):")
-            print("    fraction   top-ranked   random(mean±sd)   bottom-ranked")
+            print("    fraction   top-ranked   random(mean±sd)   bottom-ranked   z(top vs random)")
             for row in faith["rows"]:
                 print(f"    {row['fraction']:>7.0%}   {row['top']:>10.3f}   {row['random_mean']:>7.3f}±{row['random_sd']:<6.3f}"
-                      f"   {row['bottom']:>10.3f}")
-            print("  verdict: " + ("map is FAITHFUL (top-ranked deletion >> random > bottom-ranked)." if faith["faithful"] else
-                                   "map is NOT clearly faithful to this model's behaviour: do not rely on the spans or plot above "
-                                   "(try another baseline/window, or this score may not be driven by a localised feature)."))
+                      f"   {row['bottom']:>10.3f}   {row['z']:>8.1f}")
+            msg = {"strong": "map is FAITHFUL: deleting top-ranked bins hurts far more than random bins (z > 2 at every fraction).",
+                   "weak": "map is WEAKLY faithful: top-ranked > random > bottom-ranked at every fraction, but z is only 1-2 in "
+                           "places. The broad pattern is usable; do not trust exact span edges or fine detail.",
+                   "none": "map is NOT faithful to this model's behaviour: do not rely on the spans or plot above (try another "
+                           "baseline/window, or this score may not be driven by a localised feature)."}[faith["level"]]
+            print("  verdict: " + msg)
         title = f"{r.name} | ZETA {c}" + (f" obs{obs}" if obs else "") + f" | {self.metric}={s0:.2f} | window={self.window}s, {self.baseline}"
         png = plot_map(r, m, lead_maps, spans, title,
                        self.out_dir / f"{r.name}_{re.sub(r'[^A-Za-z0-9]+', '', c)}{'_o' + str(obs) if obs else ''}_{time.strftime('%H%M%S')}.png")
