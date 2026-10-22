@@ -60,8 +60,10 @@ import torch
 import zeta_relevance as Z
 
 METHODS = Z.ALL_METHODS
+BASELINES = ["qrs_oracle"]   # non-model reference: rank frames by detected-QRS proximity
 # validated categorical slots 1-6 of the reference palette, fixed order (blue, orange, aqua, yellow, magenta, green)
 METHOD_COLOURS = dict(zip(METHODS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
+METHOD_COLOURS["qrs_oracle"] = "#6b6a66"   # neutral grey: a reference, not a candidate method
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -122,7 +124,7 @@ def row_metrics(maps, ev, qrs_mask, xsim):
         if qrs_mask is not None:
             lm = Z.localisation_metrics(rel, qrs_mask)
             d["qrs_auroc"], d["qrs_mass"] = lm["auroc"], lm["mass_in_gt"]
-        if xsim is not None:
+        if xsim is not None and m in xsim:
             d["xobs_mean"], d["xobs_min"] = xsim[m]["mean_offdiag"], xsim[m]["min_offdiag"]
         out[m] = d
     return out
@@ -157,6 +159,9 @@ def cmd_run(args, parser):
     import pandas as pd
 
     Z.resolve_repo(parser, args)
+    if not args.ptbxl_root or not (Path(args.ptbxl_root) / "records500").is_dir():
+        raise SystemExit("PTB-XL folder not found: pass --ptbxl_root or set PTBXL_DATASET in .env "
+                         "(folder containing ptbxl_database.csv and records500/). Got: %r" % args.ptbxl_root)
     from transformers import T5TokenizerFast
 
     out_dir = Path(args.out)
@@ -176,7 +181,7 @@ def cmd_run(args, parser):
 
     rng = np.random.RandomState(args.seed)
     jobs = {}
-    if args.condition_source == "label":
+    if args.condition_source == "label" and args.select == "random":
         for c in conds:
             idx = np.flatnonzero(df[c].values == 1)
             if args.per_condition and len(idx) > args.per_condition:
@@ -184,6 +189,9 @@ def cmd_run(args, parser):
             for i in idx:
                 jobs.setdefault(int(df.loc[i, "ecg_id"]), []).append(c)
         print(f"{sum(len(v) for v in jobs.values())} (ECG, condition) rows over {len(jobs)} ECGs")
+    elif args.condition_source == "label":
+        print("--select top: choosing the most confidently detected labelled records per condition "
+              "once the model is loaded")
     else:
         pick = rng.choice(len(df), min(args.n_ecgs, len(df)), replace=False)
         jobs = {int(df.loc[i, "ecg_id"]): None for i in pick}
@@ -198,6 +206,31 @@ def cmd_run(args, parser):
     branch = Z.ECGBranch.from_model(model)
     spf, nf_fn = Z.frame_geometry(branch)
     bank = TextBank(model, tok, obs, dev)
+    if args.condition_source == "label" and args.select == "top":
+        n_cand = args.candidates or 4 * args.per_condition
+        jobs = {}
+        for c in conds:
+            idx = np.flatnonzero(df[c].values == 1)
+            if len(idx) > n_cand:
+                idx = rng.choice(idx, n_cand, replace=False)
+            scored = []
+            for i in idx:
+                e_id = int(df.loc[i, "ecg_id"])
+                try:
+                    x_ = Z.read_ptbxl(args.ptbxl_root, df.loc[i, "filename_hr"], args.lead_swap == "on")
+                    with torch.no_grad():
+                        v_, _ = branch.encode(torch.tensor(x_, dtype=torch.float32, device=dev).unsqueeze(0))
+                    scored.append((float(np.mean(pair_probs(v_, bank.get(c)))), e_id))
+                except Exception as e:
+                    print(f"  candidate {e_id} ({c}): {e!r}")
+            scored.sort(reverse=True)
+            for _, e_id in scored[:args.per_condition]:
+                jobs.setdefault(e_id, []).append(c)
+            if scored:
+                print(f"  {c}: {len(scored)} candidates, kept {min(len(scored), args.per_condition)} "
+                      f"(cond score {scored[min(len(scored), args.per_condition) - 1][0]:.3f} to {scored[0][0]:.3f})")
+        items = sorted(jobs.items())[s_i::s_n]
+        print(f"{sum(len(v) for v in jobs.values())} (ECG, condition) rows over {len(jobs)} ECGs")
     if args.condition_source == "zeta-top":
         all_conds = [c for c in obs if c not in args.skip]
         print(f"encoding observation text for {len(all_conds)} conditions ...")
@@ -232,7 +265,10 @@ def cmd_run(args, parser):
                 for i in obs_ids:
                     all_maps[i], logits[i] = Z.explain_pair(branch, model, x, ecg_out, b["pv"][i], b["nv"][i],
                                                            b["ps"][i], METHODS, args.target)
-                maps = all_maps[idx]
+                maps = dict(all_maps[idx])
+                if qrs_mask is not None:
+                    # reference ordering with no model in it: QRS windows first, random tie-break
+                    maps["qrs_oracle"] = qrs_mask.astype(float) + 1e-3 * np.random.RandomState(args.seed).rand(len(qrs_mask))
                 xsim = Z.cross_observation_similarity(all_maps) if len(obs_ids) > 1 else None
                 ev = Z.faithfulness(branch, x, maps, b["pv"][idx], b["nv"][idx], args.target,
                                     args.n_steps, args.n_random, seed=args.seed)
@@ -315,8 +351,8 @@ def cmd_aggregate(args, parser):
 
     recs, agree_rows = [], []
     for r in rows:
-        rng_ = abs(r["range"]) if r["range"] is not None else float("nan")
-        ok = rng_ >= args.min_range
+        rng_ = r["range"] if r["range"] is not None else float("nan")   # signed: full - blank
+        ok = rng_ >= args.min_range      # blank scoring >= full means deletion cannot "harm" it: excluded
         for m, v in r["methods"].items():
             recs.append({"ecg_id": r["ecg_id"], "condition": r["condition"], "method": m, "range": rng_,
                          "cond_score": r["cond_score"], **{k: (np.nan if x is None else x) for k, x in v.items()},
@@ -325,8 +361,8 @@ def cmd_aggregate(args, parser):
         agree_rows.append({k: (np.nan if x is None else x) for k, x in r["agree"].items()})
     df = pd.DataFrame(recs)
     n_small = int((df.groupby(["ecg_id", "condition"])["range"].first() < args.min_range).sum())
-    print(f"{n_small} rows have |full-blank| < {args.min_range}: excluded from the normalised "
-          f"advantage columns (their change in target is too small to normalise)")
+    print(f"{n_small} rows have full - blank < {args.min_range} (including rows where the blank scores "
+          f"higher than the real ECG): excluded from the normalised advantage columns")
     cols = ["del_adv", "ins_adv", "del_adv_n", "ins_adv_n", "qrs_auroc", "qrs_mass", "peak_ratio",
             "top15_mass", "xobs_mean", "xobs_min"]
     cols = [c for c in cols if c in df.columns]
@@ -335,7 +371,7 @@ def cmd_aggregate(args, parser):
     n_ecg = ecg["ecg_id"].nunique()
     print(f"{n_ecg} ECGs, {df.groupby(['ecg_id', 'condition']).ngroups} (ECG, condition) rows\n")
 
-    methods = [m for m in METHODS if m in set(df["method"])]
+    methods = [m for m in METHODS + BASELINES if m in set(df["method"])]
     summ = []
     for m in methods:
         e = ecg[ecg["method"] == m]
@@ -431,6 +467,9 @@ def cmd_check_swap(args, parser):
     import wfdb
 
     Z.resolve_repo(parser, args)
+    if not args.ptbxl_root or not (Path(args.ptbxl_root) / "records500").is_dir():
+        raise SystemExit("PTB-XL folder not found: pass --ptbxl_root or set PTBXL_DATASET in .env "
+                         "(folder containing ptbxl_database.csv and records500/). Got: %r" % args.ptbxl_root)
     from transformers import T5TokenizerFast
 
     csv = args.csv or str(Path(args.repo).expanduser() / "data_split" / "ptbxl" / args.split /
@@ -591,6 +630,11 @@ def build_parser():
     r.add_argument("--conditions", nargs="+", default=None, help="restrict to these conditions")
     r.add_argument("--skip", nargs="*", default=["NORM", "SR"],
                    help="conditions with no meaningful 'where' (default: NORM SR; pass --skip with no values for none)")
+    r.add_argument("--select", choices=["random", "top"], default="random",
+                   help="label mode: random labelled records per condition, or the --per-condition records "
+                        "ZETA scores highest (chosen from --candidates random labelled ones)")
+    r.add_argument("--candidates", type=int, default=0,
+                   help="--select top: labelled records scored per condition (default 4 x --per-condition)")
     r.add_argument("--per-condition", type=int, default=50, help="max records per condition (0 = all)")
     r.add_argument("--n-ecgs", type=int, default=200, help="records to sample in zeta-top mode")
     r.add_argument("--min-cond-score", type=float, default=0.0)
@@ -609,8 +653,9 @@ def build_parser():
     a.add_argument("--dir", required=True)
     a.add_argument("--min-cond-score", type=float, default=0.0,
                    help="only rows where ZETA's own possibility score for the condition is at least this")
-    a.add_argument("--min-range", type=float, default=0.2,
-                   help="drop rows from the normalised columns when |full - blank| (logit units) is below this")
+    a.add_argument("--min-range", type=float, default=0.05,
+                   help="drop rows from the normalised columns when full - blank (logit units) is below this "
+                        "(ZETA's scores are compressed near 0.5, so 0.2 keeps very few rows)")
     a.add_argument("--conditions", nargs="+", default=None)
 
     c = sub.add_parser("check-swap", help="ZETA zero-shot AUROC with the aVL/aVF swap on vs off")
