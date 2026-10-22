@@ -332,7 +332,9 @@ def faithfulness(branch, x_np, relevance, pos_vec, neg_vec, target="logit_diff",
 def _randomise_(module, gen):
     for p in module.parameters():
         if p.ndim >= 2:
-            p.data.normal_(0.0, 0.02, generator=gen)
+            # draw on CPU (the generator lives there), then move: works for cuda parameters too
+            noise = torch.empty(p.shape, dtype=p.dtype, device="cpu").normal_(0.0, 0.02, generator=gen)
+            p.data.copy_(noise.to(p.device))
 
 
 def sanity_cascade(branch, x_np, pos_vec, neg_vec, target="logit_diff", seed=0):
@@ -491,6 +493,11 @@ def plot_methods(x_np, maps, spf, title, path, lead=1, primary="chefer", fs=SAMP
 def load_model(config_path, checkpoint_path, device):
     from types import SimpleNamespace
     from models.cmelt import M3AEModel
+    if not checkpoint_path:
+        raise SystemExit("No checkpoint given: pass --checkpoint /path/to/ckpt.pt "
+                         "or set CHECKPOINT_PATH in your .env / environment.")
+    if not os.path.isfile(checkpoint_path):
+        raise SystemExit(f"Checkpoint not found: {checkpoint_path}")
     with open(config_path) as f:
         cfg = SimpleNamespace(**json.load(f)["model"])
     model = M3AEModel(cfg)
