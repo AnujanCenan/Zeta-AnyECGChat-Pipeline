@@ -58,6 +58,9 @@ import torch.nn.functional as F
 SAMPLE_RATE = 500
 SOFTMAX_TEMP = 0.5  # ZETA's training/inference temperature (main.py: softmax(i / 0.5))
 LEAD_NAMES = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+# ZETA was pretrained on MIMIC-IV-ECG, where aVF precedes aVL. data_load.py intends to swap leads 4/5
+# of standard-order data to match (see --lead-swap).
+LEAD_NAMES_ZETA = ["I", "II", "III", "aVR", "aVF", "aVL", "V1", "V2", "V3", "V4", "V5", "V6"]
 ALL_METHODS = ["chefer", "rollout", "attn_last", "attn_mean", "gradcam_cnn", "cross_attn_fixed"]
 GRAPH_METHODS = ["chefer", "rollout", "attn_last", "attn_mean", "gradcam_cnn"]  # need only the ECG branch
 
@@ -407,10 +410,47 @@ def relevance_to_intervals(rel, spf, fs=SAMPLE_RATE, top_frac=0.15, merge_gap=2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# One observation / all observations
+# ─────────────────────────────────────────────────────────────────────────────
+
+def explain_pair(branch, model, x_np, ecg_out, pos_vec, neg_vec, text_seq, methods, target="logit_diff"):
+    """All requested maps for ONE observation pair. Returns ({method: map}, target value)."""
+    maps, logit = explain(branch, x_np, pos_vec, neg_vec, target)
+    maps = {k: maps[k] for k in methods if k in GRAPH_METHODS}
+    if "cross_attn_fixed" in methods:
+        maps["cross_attn_fixed"] = cross_attention_map(model, ecg_out, text_seq)
+    return maps, logit
+
+
+def cross_observation_similarity(maps_by_obs):
+    """maps_by_obs: {obs_index: {method: map}}. For each method, the Spearman matrix between
+    the maps of different observations on the SAME ECG. ~1.0 everywhere means the map does not
+    depend on the observation (rollout / raw attention are constant by construction). Lower
+    values show target dependence, but observations that share evidence (rsr' and a wide QRS
+    both live in the QRS) can legitimately look alike, so read it as a control, not a score."""
+    from scipy.stats import spearmanr
+    ids = sorted(maps_by_obs)
+    out = {}
+    for m in maps_by_obs[ids[0]]:
+        mat = np.full((len(ids), len(ids)), np.nan)
+        for a, ia in enumerate(ids):
+            for b, ib in enumerate(ids):
+                x, y = maps_by_obs[ia][m], maps_by_obs[ib][m]
+                mat[a, b] = 1.0 if a == b else (
+                    spearmanr(x, y).correlation if np.std(x) > 0 and np.std(y) > 0 else np.nan)
+        off = mat[~np.eye(len(ids), dtype=bool)]
+        out[m] = {"obs": ids, "matrix": mat.tolist(),
+                  "mean_offdiag": float(np.nanmean(off)) if np.isfinite(off).any() else float("nan"),
+                  "min_offdiag": float(np.nanmin(off)) if np.isfinite(off).any() else float("nan")}
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Plot
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_methods(x_np, maps, spf, title, path, lead=1, primary="chefer", fs=SAMPLE_RATE):
+def plot_methods(x_np, maps, spf, title, path, lead=1, primary="chefer", fs=SAMPLE_RATE,
+                 lead_names=LEAD_NAMES_ZETA):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -431,7 +471,7 @@ def plot_methods(x_np, maps, spf, title, path, lead=1, primary="chefer", fs=SAMP
         ax.imshow(to_img(maps[primary]), aspect="auto", cmap="Reds", alpha=0.45,
                   extent=[0, len(maps[primary]) * spf / fs, x_np[lead].min(), x_np[lead].max()], zorder=0)
     ax.plot(t, x_np[lead], color="black", lw=0.8, zorder=2)
-    ax.set_ylabel(f"lead {LEAD_NAMES[lead]}")
+    ax.set_ylabel(f"lead {lead_names[lead]}")
     ax.set_title(title, fontsize=10)
     ax.set_xlim(0, T / fs)
     for a, n in zip(axes[1:], names):
@@ -475,26 +515,66 @@ def encode_text(model, tokenizer, text, device):
     return vec, seq
 
 
+def prepare_ecg(arr: np.ndarray, lead_swap: bool = True) -> np.ndarray:
+    """(T, 12) standard-order signal -> (12, 5000) in ZETA's input convention: first 5000 samples,
+    GLOBAL min-max over the whole array (data_load.py), and optionally the aVL<->aVF swap."""
+    arr = np.asarray(arr, dtype=np.float32)[:5000, :]
+    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+    if lead_swap:
+        arr[:, [4, 5]] = arr[:, [5, 4]]
+    return arr.T.copy()
+
+
+def read_ptbxl(root, filename_hr, lead_swap: bool = True) -> np.ndarray:
+    import wfdb
+    sig, _ = wfdb.rdsamp(str(Path(root) / filename_hr))
+    return prepare_ecg(sig, lead_swap)
+
+
 def load_ecg(args) -> np.ndarray:
-    """-> (12, T) float32, GLOBAL min-max over the whole record (as data_load.py does)."""
+    """-> (12, T) float32 for the single-record CLI."""
+    swap = getattr(args, "lead_swap", "on") == "on"
     if args.npy:
         arr = np.load(args.npy).astype(np.float32)
         if arr.shape[0] == 12 and arr.shape[1] != 12:
             arr = arr.T
-    else:
+        return prepare_ecg(arr, swap)
+    if args.ecg_id is not None:
         import pandas as pd
-        import wfdb
-        root = args.ptbxl_root
-        if args.ecg_id is not None:
-            db = pd.read_csv(Path(root) / "ptbxl_database.csv", index_col="ecg_id")
-            fn = db.loc[args.ecg_id, "filename_hr"]
-        else:
-            fn = args.filename_hr
-        arr, _ = wfdb.rdsamp(str(Path(root) / fn))
-        arr = arr.astype(np.float32)
-    arr = arr[:5000, :]
-    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-    return arr.T.copy()
+        db = pd.read_csv(Path(args.ptbxl_root) / "ptbxl_database.csv", index_col="ecg_id")
+        fn = db.loc[args.ecg_id, "filename_hr"]
+    else:
+        fn = args.filename_hr
+    return read_ptbxl(args.ptbxl_root, fn, swap)
+
+
+def resolve_repo(p, args):
+    """Validate --repo, put it on sys.path, make relative --config/--observations repo-relative."""
+    if not args.repo:
+        p.error("ZETA repo root not set: pass --repo or set ZETA_REPO in .env")
+    repo = Path(args.repo).expanduser().resolve()
+    if not (repo / "models" / "cmelt.py").is_file():
+        p.error(f"{repo} does not look like the ZETA repo root (models/cmelt.py not found)")
+    sys.path.insert(0, str(repo))
+    in_repo = lambda q: str(q if os.path.isabs(q) else repo / q)
+    args.config, args.observations = in_repo(args.config), in_repo(args.observations)
+    return repo
+
+
+def qrs_frame_mask(x_np, spf, n_frames, fs=SAMPLE_RATE, half_width_frames=3):
+    """PROXY for beat locations (not ground truth): smoothed squared first difference summed over
+    leads, peaks >= 0.4 s apart. Returns a boolean frame mask (+-3 frames = +-96 ms around each
+    peak) and the beat count; (None, n) when fewer than 3 beats are found."""
+    from scipy.signal import find_peaks
+    e = np.convolve((np.diff(x_np, axis=1) ** 2).sum(0), np.ones(20) / 20, mode="same")
+    pk, _ = find_peaks(e, distance=int(0.4 * fs), height=np.percentile(e, 90))
+    if len(pk) < 3:
+        return None, len(pk)
+    mask = np.zeros(n_frames, bool)
+    for q in pk:
+        f = q // spf
+        mask[max(0, f - half_width_frames): min(n_frames, f + half_width_frames + 1)] = True
+    return mask, len(pk)
 
 
 def parse_intervals(s):
@@ -521,11 +601,15 @@ def main():
                    help="relative paths resolve against the ZETA repo root")
     p.add_argument("--observations", default="configs/observations.json",
                    help="relative paths resolve against the ZETA repo root")
-    p.add_argument("--repo", default=os.getenv("ZETA_REPO"),
+    p.add_argument("--repo", default=os.getenv("ZETA_REPO") or os.getenv("ZETA_REPO_ROOT"),
                    help="ZETA repo root (for `import models`); default: ZETA_REPO from .env "
                         "(ZETA_REPO_ROOT also accepted)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--obs-index", type=int, default=None, help="positive observation to explain (default: top-scoring)")
+    p.add_argument("--all-obs", action="store_true",
+                   help="compute maps for EVERY positive observation (one plot/npz/report each, plus a "
+                        "cross-observation similarity summary). --eval/--sanity/--gt-intervals still "
+                        "apply to the single cited observation (--obs-index, default top-scoring)")
     p.add_argument("--target", default="logit_diff", choices=["logit_diff", "pos_sim"])
     p.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS)
     p.add_argument("--eval", action="store_true", help="deletion/insertion curves")
@@ -533,19 +617,16 @@ def main():
     p.add_argument("--n-random", type=int, default=10)
     p.add_argument("--sanity", action="store_true", help="cascading weight-randomisation check")
     p.add_argument("--gt-intervals", default=None, help='seconds, e.g. "2.1-3.4,5.0-6.2"')
-    p.add_argument("--plot-lead", type=int, default=1)
+    p.add_argument("--lead-swap", choices=["on", "off"], default="on",
+                   help="swap aVL/aVF into MIMIC order (ZETA's pretraining order); check on a subset "
+                        "whether on or off gives better ZETA scores")
+    p.add_argument("--plot-lead", type=int, default=1,
+                   help="index in ZETA's lead order (6 = V1)")
     p.add_argument("--primary", default="chefer", choices=ALL_METHODS)
     p.add_argument("--save_dir", default=".")
     args = p.parse_args()
 
-    if not args.repo:
-        p.error("ZETA repo root not set: pass --repo or set ZETA_REPO in .env")
-    repo = Path(args.repo).expanduser().resolve()
-    if not (repo / "models" / "cmelt.py").is_file():
-        p.error(f"{repo} does not look like the ZETA repo root (models/cmelt.py not found)")
-    sys.path.insert(0, str(repo))
-    in_repo = lambda q: str(q if os.path.isabs(q) else repo / q)
-    args.config, args.observations = in_repo(args.config), in_repo(args.observations)
+    resolve_repo(p, args)
     from transformers import T5TokenizerFast
 
     dev = torch.device(args.device)
@@ -567,23 +648,26 @@ def main():
     nv, _ = zip(*[encode_text(model, tok, t, dev) for t in neg_t[:n_pairs]])
     probs = [float(torch.sigmoid(target_scalar(vec, pv[i], nv[i])[0])) for i in range(n_pairs)]
     print(f"Condition {args.condition}: possibility score {np.mean(probs):.3f} (ZETA temperature {SOFTMAX_TEMP})")
-    for i in range(n_pairs):
-        print(f"  [{i}] P(pair)={probs[i]:.3f}  {pos_t[i]}")
     idx = args.obs_index if args.obs_index is not None else int(np.argmax(probs))
-    print(f"\nExplaining pair {idx}: \"{pos_t[idx]}\"  vs  \"{neg_t[idx]}\"  (target = {args.target})")
+    for i in range(n_pairs):
+        print(f"  [{i}]{'*' if i == idx else ' '} P(pair)={probs[i]:.3f}  {pos_t[i]}")
+    print(f"\nCited observation (*): pair {idx}: \"{pos_t[idx]}\"  vs  \"{neg_t[idx]}\"  (target = {args.target})")
 
-    graph_methods = [m for m in args.methods if m in GRAPH_METHODS]
-    maps, logit = explain(branch, x, pv[idx], nv[idx], args.target)
-    maps = {k: maps[k] for k in graph_methods}
-    if "cross_attn_fixed" in args.methods:
-        maps["cross_attn_fixed"] = cross_attention_map(model, ecg_out, ps[idx])
+    obs_ids = list(range(n_pairs)) if args.all_obs else [idx]
+    all_maps, logits = {}, {}
+    for i in obs_ids:
+        all_maps[i], logits[i] = explain_pair(branch, model, x, ecg_out, pv[i], nv[i], ps[i],
+                                              args.methods, args.target)
+    maps, logit = all_maps[idx], logits[idx]
     print(f"target value {logit:.3f}")
 
-    stem = f"ECG-{args.ecg_id if args.ecg_id is not None else 'x'}_{args.condition}_obs{idx}"
+    ecg_tag = args.ecg_id if args.ecg_id is not None else "x"
     out_dir = Path(args.save_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    report = {"condition": args.condition, "obs_index": idx, "obs_text": pos_t[idx],
-              "target": args.target, "target_value": logit, "score_pair": probs[idx]}
+    reports = {i: {"condition": args.condition, "obs_index": i, "obs_text": pos_t[i],
+                   "target": args.target, "target_value": logits[i], "score_pair": probs[i]}
+               for i in obs_ids}
+    report = reports[idx]
 
     if args.gt_intervals:
         mask = gt_frame_mask(parse_intervals(args.gt_intervals), len(next(iter(maps.values()))), spf)
@@ -611,13 +695,30 @@ def main():
         for r in rows:
             print("  " + r["stage"].ljust(14) + "".join(f"{r[k]:12.3f}" for k in GRAPH_METHODS))
 
-    np.savez(out_dir / f"{stem}_relevance.npz", ecg=x, spf=spf, **maps)
-    report["intervals_top15pct"] = {k: relevance_to_intervals(v, spf) for k, v in maps.items()}
-    with open(out_dir / f"{stem}_report.json", "w") as f:
-        json.dump(report, f, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
-    title = f'{args.condition}  "{pos_t[idx]}"  pair score {probs[idx]:.2f}'
-    plot_methods(x, maps, spf, title, out_dir / f"{stem}_methods.png", lead=args.plot_lead, primary=args.primary)
-    print(f"\nSaved to {out_dir}/{stem}_*")
+    if len(obs_ids) > 1:
+        sim = cross_observation_similarity(all_maps)
+        print(f"\nAcross-observation similarity of maps on this ECG ({len(obs_ids)} observations; "
+              f"Spearman, off-diagonal). ~1.0 = map ignores which observation was asked about:")
+        print(f"  {'method':<18}{'mean':>8}{'min':>8}")
+        for m_, v in sim.items():
+            print(f"  {m_:<18}{v['mean_offdiag']:8.2f}{v['min_offdiag']:8.2f}")
+        with open(out_dir / f"ECG-{ecg_tag}_{args.condition}_obs_similarity.json", "w") as f:
+            json.dump({"condition": args.condition, "cited_obs": idx,
+                       "observations": [{"index": i, "text": pos_t[i], "score_pair": probs[i],
+                                         "target_value": logits[i]} for i in obs_ids],
+                       "similarity": sim}, f, indent=2)
+
+    for i in obs_ids:
+        stem = f"ECG-{ecg_tag}_{args.condition}_obs{i}"
+        np.savez(out_dir / f"{stem}_relevance.npz", ecg=x, spf=spf, **all_maps[i])
+        reports[i]["intervals_top15pct"] = {k: relevance_to_intervals(v, spf) for k, v in all_maps[i].items()}
+        with open(out_dir / f"{stem}_report.json", "w") as f:
+            json.dump(reports[i], f, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
+        title = f'{args.condition}  "{pos_t[i]}"  pair score {probs[i]:.2f}'
+        plot_methods(x, all_maps[i], spf, title, out_dir / f"{stem}_methods.png",
+                     lead=args.plot_lead, primary=args.primary,
+                     lead_names=LEAD_NAMES_ZETA if args.lead_swap == "on" else LEAD_NAMES)
+    print(f"\nSaved {len(obs_ids)} observation(s) to {out_dir}/ECG-{ecg_tag}_{args.condition}_obs*")
 
 
 if __name__ == "__main__":
