@@ -6,6 +6,7 @@ Run the ZETA localisation methods over many PTB-XL records and compare them.
     python zeta_relevance_batch.py run       --split sub_class --out results/ [--shard 0/8]
     python zeta_relevance_batch.py aggregate --dir results/
     python zeta_relevance_batch.py check-swap --split sub_class      # aVL/aVF swap on vs off, ZETA AUROC
+    python zeta_relevance_batch.py obs-auroc --out obs_auroc.csv     # AUROC of each single observation pair
 
 `check-swap` computes ZETA's own per-condition zero-shot AUROC on a sample of the test fold with the
 aVL<->aVF swap on and off (no relevance maps, forward passes only) so you can pick --lead-swap with data.
@@ -624,6 +625,94 @@ def cmd_check_swap(args, parser):
         print(f"wrote {args.out}")
 
 
+def cmd_obs_auroc(args, parser):
+    """Per-OBSERVATION zero-shot AUROC: does ZETA's score for each individual observation pair separate the
+    records with the condition from the rest? (check-swap reports the condition level, i.e. the mean over
+    a condition's observations.) If single observations sit near 0.5, or are interchangeable with each
+    other, there is no observation-specific evidence for a localisation method to find."""
+    import pandas as pd
+    import wfdb
+    from scipy.stats import spearmanr
+
+    Z.resolve_repo(parser, args)
+    if not args.ptbxl_root or not (Path(args.ptbxl_root) / "records500").is_dir():
+        raise SystemExit("PTB-XL folder not found: pass --ptbxl_root or set PTBXL_DATASET in .env "
+                         "(folder containing ptbxl_database.csv and records500/). Got: %r" % args.ptbxl_root)
+    from transformers import T5TokenizerFast
+
+    csv = args.csv or str(Path(args.repo).expanduser() / "data_split" / "ptbxl" / args.split /
+                          f"ptbxl_{args.split}_test.csv")
+    df = pd.read_csv(csv)
+    df = df[df["strat_fold"].isin(args.folds)].reset_index(drop=True)
+    if args.n_ecgs and len(df) > args.n_ecgs:
+        df = df.iloc[np.random.RandomState(args.seed).choice(len(df), args.n_ecgs, replace=False)].reset_index(drop=True)
+    with open(args.observations) as f:
+        obs = json.load(f)
+    conds = [c for c in df.columns[6:] if c in obs and c not in args.skip and (not args.conditions or c in args.conditions)]
+    conds = [c for c in conds if df[c].sum() >= args.min_pos and (len(df) - df[c].sum()) >= args.min_pos]
+    print(f"{len(df)} ECGs from {csv}; {len(conds)} conditions with >= {args.min_pos} positives and negatives")
+
+    dev = torch.device(args.device)
+    model = Z.load_model(args.config, args.checkpoint, dev)
+    tok = T5TokenizerFast.from_pretrained("google/flan-t5-base", do_lower_case=True)
+    branch = Z.ECGBranch.from_model(model).eval()
+    bank = TextBank(model, tok, obs, dev)
+    PV = {c: torch.stack(list(bank.get(c)["pv"])).cpu() for c in conds}
+    NV = {c: torch.stack(list(bank.get(c)["nv"])).cpu() for c in conds}
+
+    vecs, t0 = [], time.time()
+    for i in range(0, len(df), args.batch):
+        raws = []
+        for fn in df["filename_hr"].iloc[i:i + args.batch]:
+            sig, _ = wfdb.rdsamp(str(Path(args.ptbxl_root) / fn))
+            raws.append(sig)
+        xb = torch.tensor(np.stack([Z.prepare_ecg(r, args.lead_swap == "on") for r in raws]),
+                          dtype=torch.float32, device=dev)
+        with torch.no_grad():
+            vecs.append(branch.encode(xb)[0].cpu())
+        if (i // args.batch) % 10 == 0:
+            print(f"  {min(i + args.batch, len(df))}/{len(df)} ECGs, {(time.time() - t0) / 60:.1f} min", flush=True)
+    V = torch.cat(vecs)
+
+    rng = np.random.RandomState(args.seed)
+    boots = [rng.randint(0, len(df), len(df)) for _ in range(args.boot)]
+    rows = []
+    for c in conds:
+        b = bank.get(c)
+        sp, sn = (V @ PV[c].T).numpy(), (V @ NV[c].T).numpy()
+        pair = 1.0 / (1.0 + np.exp(-(sp - sn) / Z.SOFTMAX_TEMP))          # (N, n_pairs)
+        y = df[c].values == 1
+        cond_auc = fast_auroc(pair.mean(1), y)
+        for i in range(pair.shape[1]):
+            rest = np.delete(pair, i, axis=1).mean(1) if pair.shape[1] > 1 else None
+            ci = [fast_auroc(pair[ix, i], y[ix]) for ix in boots]
+            rows.append({"condition": c, "obs_index": i, "n_pos": int(y.sum()), "positive": b["pos_t"][i],
+                         "negative": b["neg_t"][i], "auroc_pair": fast_auroc(pair[:, i], y),
+                         "auroc_pair_lo": float(np.nanpercentile(ci, 2.5)), "auroc_pair_hi": float(np.nanpercentile(ci, 97.5)),
+                         "auroc_pos_only": fast_auroc(sp[:, i], y), "auroc_neg_only": fast_auroc(-sn[:, i], y),
+                         "corr_with_rest": (float(spearmanr(pair[:, i], rest).correlation) if rest is not None else np.nan),
+                         "auroc_condition": cond_auc})
+    R = pd.DataFrame(rows)
+    with pd.option_context("display.width", 250, "display.max_rows", None, "display.max_colwidth", 48,
+                           "display.float_format", "{:.3f}".format):
+        print("\nPer-observation AUROC (positives of the condition vs the rest of the sample)")
+        print("  auroc_pair: ZETA's actual score for this pair; auroc_pos_only: similarity to the positive phrase alone;")
+        print("  auroc_neg_only: (negated) similarity to the negative phrase alone; corr_with_rest: Spearman of this pair's")
+        print("  score with the mean of the condition's OTHER pairs (1.0 = interchangeable, nothing observation-specific)")
+        print(R[["condition", "obs_index", "positive", "auroc_pair", "auroc_pair_lo", "auroc_pair_hi",
+                 "auroc_pos_only", "auroc_neg_only", "corr_with_rest"]].to_string(index=False))
+        g = R.groupby("condition").agg(n_pos=("n_pos", "first"), n_obs=("obs_index", "count"),
+                                       condition_auroc=("auroc_condition", "first"), obs_min=("auroc_pair", "min"),
+                                       obs_median=("auroc_pair", "median"), obs_max=("auroc_pair", "max"),
+                                       mean_corr_with_rest=("corr_with_rest", "mean"))
+        print("\nPer condition: AUROC of the mean score vs the spread over its single observations")
+        print(g.to_string())
+    if args.out:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        R.to_csv(args.out, index=False)
+        print(f"wrote {args.out}")
+
+
 def _lead_figure(by, lead_order, path):
     import matplotlib
     matplotlib.use("Agg")
@@ -784,6 +873,23 @@ def build_parser():
     c.add_argument("--boot", type=int, default=200)
     c.add_argument("--seed", type=int, default=0)
     c.add_argument("--out", default=None, help="optional CSV of the per-condition table")
+
+    o = sub.add_parser("obs-auroc", help="zero-shot AUROC of each individual observation pair (not just the condition)")
+    for k, v in (("--split", dict(default="sub_class", choices=["sub_class", "super_class", "form", "rhythm"])),
+                 ("--csv", dict(default=None)), ("--folds", dict(type=int, nargs="+", default=[10])),
+                 ("--ptbxl_root", dict(default=os.getenv("PTBXL_DATASET"))),
+                 ("--checkpoint", dict(default=os.getenv("CHECKPOINT_PATH"))),
+                 ("--config", dict(default="configs/config.json")),
+                 ("--observations", dict(default="configs/observations.json")),
+                 ("--repo", dict(default=os.getenv("ZETA_REPO") or os.getenv("ZETA_REPO_ROOT"))),
+                 ("--device", dict(default="cuda" if torch.cuda.is_available() else "cpu")),
+                 ("--lead-swap", dict(choices=["on", "off"], default="on")),
+                 ("--conditions", dict(nargs="+", default=None)), ("--skip", dict(nargs="*", default=[])),
+                 ("--n-ecgs", dict(type=int, default=0, help="random sample of the fold (0 = all)")),
+                 ("--min-pos", dict(type=int, default=10)), ("--batch", dict(type=int, default=16)),
+                 ("--boot", dict(type=int, default=200)), ("--seed", dict(type=int, default=0)),
+                 ("--out", dict(default=None, help="CSV of the per-observation table"))):
+        o.add_argument(k, **v)
     return p
 
 
@@ -797,6 +903,8 @@ def main(argv=None):
         cmd_run(args, p)
     elif args.cmd == "check-swap":
         cmd_check_swap(args, p)
+    elif args.cmd == "obs-auroc":
+        cmd_obs_auroc(args, p)
     else:
         cmd_aggregate(args, p)
 
