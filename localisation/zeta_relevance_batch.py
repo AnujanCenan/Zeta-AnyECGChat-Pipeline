@@ -144,6 +144,15 @@ def method_agreement(maps):
     return out
 
 
+def load_obs_filter(path, min_auroc):
+    """{condition: [observation indices]} whose per-observation AUROC (from `obs-auroc`) is >= min_auroc
+    with a bootstrap interval above 0.5."""
+    import pandas as pd
+    t = pd.read_csv(path)
+    ok = t[(t["auroc_pair"] >= min_auroc) & (t["auroc_pair_lo"] > 0.5)]
+    return {c: sorted(int(i) for i in g["obs_index"]) for c, g in ok.groupby("condition")}
+
+
 def load_done(out_dir):
     done = set()
     for f in glob.glob(str(out_dir / "results*.jsonl")):
@@ -179,6 +188,14 @@ def cmd_run(args, parser):
         obs = json.load(f)
     label_cols = [c for c in df.columns[6:] if c in obs]
     conds = [c for c in (args.conditions or label_cols) if c in label_cols and c not in args.skip]
+    allowed = None
+    if args.obs_filter:
+        allowed = load_obs_filter(args.obs_filter, args.min_obs_auroc)
+        dropped = [c for c in conds if c not in allowed]
+        conds = [c for c in conds if c in allowed]
+        print(f"--obs-filter {args.obs_filter} (pair AUROC >= {args.min_obs_auroc}, CI above 0.5): "
+              + "; ".join(f"{c}: obs {allowed[c]}" for c in conds)
+              + (f"  | no qualifying observation, skipped: {dropped}" if dropped else ""))
     print(f"{len(df)} records in {csv} (folds {args.folds}); conditions: {len(conds)} -> {conds}")
 
     rng = np.random.RandomState(args.seed)
@@ -222,7 +239,10 @@ def cmd_run(args, parser):
                     x_ = Z.read_ptbxl(args.ptbxl_root, df.loc[i, "filename_hr"], args.lead_swap == "on")
                     with torch.no_grad():
                         v_, _ = branch.encode(torch.tensor(x_, dtype=torch.float32, device=dev).unsqueeze(0))
-                    scored.append((float(np.mean(pair_probs(v_, bank.get(c)))), e_id))
+                    pp_ = pair_probs(v_, bank.get(c))
+                    if allowed:
+                        pp_ = [pp_[k] for k in allowed[c] if k < len(pp_)]
+                    scored.append((float(np.mean(pp_)), e_id))
                 except Exception as e:
                     print(f"  candidate {e_id} ({c}): {e!r}")
             scored.sort(reverse=True)
@@ -260,6 +280,11 @@ def cmd_run(args, parser):
                 b = bank.get(cond)
                 probs = pair_probs(vec, b)
                 cond_score, idx = float(np.mean(probs)), int(np.argmax(probs))
+                if allowed is not None:
+                    if cond not in allowed:
+                        continue
+                    ks = [k for k in allowed[cond] if k < len(probs)]
+                    idx = max(ks, key=lambda k: probs[k])     # cited observation: best-scoring qualifying one
                 if cond_score < args.min_cond_score:
                     continue
                 obs_ids = list(range(len(probs))) if (not args.no_xobs and len(probs) > 1) else [idx]
@@ -832,6 +857,11 @@ def build_parser():
     r.add_argument("--target", default="logit_diff", choices=["logit_diff", "pos_sim"])
     r.add_argument("--n-steps", type=int, default=20)
     r.add_argument("--n-random", type=int, default=5)
+    r.add_argument("--obs-filter", default=None,
+                   help="CSV from `obs-auroc`: explain only observations whose pair AUROC is >= --min-obs-auroc "
+                        "(with the bootstrap CI above 0.5). The cited observation is the best-scoring qualifying one; "
+                        "conditions with none are skipped. Cross-observation maps still use all observations.")
+    r.add_argument("--min-obs-auroc", type=float, default=0.75)
     r.add_argument("--no-extra-baselines", action="store_true",
                    help="only the qrs_oracle reference (skip qrs_center, pwave_window, twave_window)")
     r.add_argument("--no-specificity", action="store_true",
