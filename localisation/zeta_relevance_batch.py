@@ -878,7 +878,7 @@ def make_figure(S, mat, methods, path, n_ecg):
 # localise: per-OBSERVATION maps over PTB-XL (the "final product" run)
 # ─────────────────────────────────────────────────────────────────────────────
 
-LOC_BASELINES = ["qrs_oracle", "qrs_center", "energy"]
+LOC_BASELINES = ["qrs_oracle", "qrs_center", "energy", "pwave_window", "twave_window"]
 
 
 def localise_figure(x, spf, lead_names, ecg_id, cond, cond_score, obs_texts, pair_scores, chefer_maps, base_map, path):
@@ -1142,6 +1142,7 @@ def summarise_localise(d, min_range=0.05, obs_auroc=None, min_n=8):
     T.to_csv(d / "observation_table.csv", index=False)
     show = ["condition", "obs_index", "obs_text", "n_ecg"] + (["auroc_pair"] if auc is not None else []) + \
            [c for c in ("chefer_del", "chefer_ins", "rollout_del", "rollout_ins", "energy_del", "qrs_oracle_del",
+                        "pwave_window_del", "twave_window_del",
                         "chefer_verdict", "rollout_verdict") if c in T]
     with pd.option_context("display.width", 250, "display.max_columns", None, "display.max_colwidth", 44,
                            "display.float_format", "{:.2f}".format):
