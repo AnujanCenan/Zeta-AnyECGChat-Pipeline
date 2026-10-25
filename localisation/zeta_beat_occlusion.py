@@ -292,6 +292,14 @@ def cmd_chimera(args):
                     labels[hs] = True
                     sc_c, full_c = C.score_beats(chim, hpk, cond, ids)
                     sc_h, full_h = C.score_beats(host, hpk, cond, ids)
+                    # observation-specificity: score the SAME chimera/host with another condition's observations
+                    others = [c2 for c2 in conds if c2 != cond]
+                    mm_cond, sc_c2, sc_h2, ids2 = None, None, None, None
+                    if others and not args.no_mismatch:
+                        mm_cond = others[int(C.rng.randint(len(others)))]
+                        ids2 = C.obs_ids(mm_cond)
+                        sc_c2, _ = C.score_beats(chim, hpk, mm_cond, ids2)
+                        sc_h2, _ = C.score_beats(host, hpk, mm_cond, ids2)
                     rng = np.random.RandomState(args.seed + trial_id)
                     rows = []
                     for i in list(ids) + [-1]:
@@ -310,6 +318,11 @@ def cmd_chimera(args):
                             r[f"{m}_auroc_null"] = auroc(pick(sc_h), labels)
                             r[f"{m}_top1"] = top1_hit(pick(sc_c), labels)
                             r[f"{m}_top1_null"] = top1_hit(pick(sc_h), labels)
+                        if i == -1 and sc_c2 is not None:
+                            r["mismatch_condition"] = mm_cond
+                            for m in ("occlusion", "chefer", "rollout", "energy"):
+                                r[f"{m}_auroc_mm"] = auroc(np.mean([sc_c2[m][j] for j in ids2], 0), labels)
+                                r[f"{m}_auroc_null_mm"] = auroc(np.mean([sc_h2[m][j] for j in ids2], 0), labels)
                         rs = rng.rand(len(hpk))
                         r["random_auroc"], r["random_top1"] = auroc(rs, labels), top1_hit(rs, labels)
                         rows.append(r)
@@ -368,6 +381,28 @@ def summarise_chimera(d):
         out.append(block(g, {"scope": f"{c} obs {i}: {g['obs_text'].iloc[0][:48]}", "k": k}))
     T = pd.DataFrame(out)
     T.to_csv(d / "chimera_table.csv", index=False)
+    if "chefer_auroc_mm" in g_all:
+        print("\nObservation specificity: gain over host with the MATCHING condition's observations minus the gain "
+              "with another condition's observations on the same chimera (>0 = depends on the observation)")
+        sp_rows = []
+        gm = g_all.dropna(subset=["chefer_auroc_mm"])
+        for key, gg in [("all", gm)] + [(c, x) for c, x in gm.groupby("condition")]:
+            for k, gk in gg.groupby("k"):
+                for m in ms:
+                    d_ = (gk[f"{m}_auroc"] - gk[f"{m}_auroc_null"]) - (gk[f"{m}_auroc_mm"] - gk[f"{m}_auroc_null_mm"])
+                    d_ = d_.dropna().values
+                    if len(d_) < 3:
+                        continue
+                    lo, hi = B.boot_ci(d_)
+                    sp_rows.append({"scope": key, "k": k, "method": m, "n": len(d_),
+                                    "gain_matched": float((gk[f"{m}_auroc"] - gk[f"{m}_auroc_null"]).mean()),
+                                    "gain_mismatched": float((gk[f"{m}_auroc_mm"] - gk[f"{m}_auroc_null_mm"]).mean()),
+                                    "specificity": float(d_.mean()), "lo": lo, "hi": hi})
+        SP = pd.DataFrame(sp_rows)
+        SP.to_csv(d / "chimera_specificity.csv", index=False)
+        with pd.option_context("display.width", 200, "display.float_format", "{:+.3f}".format):
+            print(SP[SP["scope"] == "all"].to_string(index=False))
+            print("\n(per condition in chimera_specificity.csv)")
     show = ["scope", "k", "n_trials", "frac_responsive", "mean_delta_target"] + [
         f"{m}_{s}" for m in ms for s in ("auroc", "auroc_null")] + ["random_auroc"]
     with pd.option_context("display.width", 280, "display.max_columns", None, "display.max_colwidth", 52,
@@ -558,6 +593,8 @@ def build_parser():
     _add_common(c)
     c.add_argument("--trials", type=int, default=40, help="donor records per condition")
     c.add_argument("--k", type=int, nargs="+", default=[1, 3], help="beats transplanted per trial")
+    c.add_argument("--no-mismatch", action="store_true",
+                   help="skip the observation-specificity test (scoring the same chimera with another condition's observations)")
     c.add_argument("--donor-norm", action="store_true",
                    help="CONTROL: donor beats come from NORM records (no condition feature); methods that still "
                         "'find' them are detecting the splice, not the observation")
