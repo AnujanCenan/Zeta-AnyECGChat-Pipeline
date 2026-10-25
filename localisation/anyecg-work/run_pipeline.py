@@ -162,6 +162,9 @@ def parse_args() -> argparse.Namespace:
                          "larger buffer than LBBB/RBBB do. Revisit before treating results as final.")
     p.add_argument("--seed", type=int, default=None,
                     help="Random seed for control-window sampling, for reproducible runs.")
+    p.add_argument("--skip-extra-controls", action="store_true",
+                    help="Only the original random matched-length control in crop-and-recheck; skip the "
+                         "beat-matched control and the max-energy crop.")
     p.add_argument("--skip-recheck", action="store_true",
                     help="Skip the crop-and-recheck validation step, running only ZETA + "
                          "anyECG-chat localization (e.g. for a quick smoke test).")
@@ -325,12 +328,17 @@ def main() -> None:
                         pad_to_seconds=args.pad_to_seconds,
                         min_gap=args.min_gap,
                         rng=rng,
+                        extra_controls=not args.skip_extra_controls,
                     )
                     record_result["recheck"][variant] = result_to_jsonable(recheck)
                     all_recheck_results[variant].append(recheck)
                     if recheck is not None:
                         print(f"  [{variant}] recheck: localized={recheck.localized_score:.3f} "
                               f"control={recheck.control_score} diff={recheck.score_difference}")
+                        if recheck.beat_matched_score is not None or recheck.energy_score is not None:
+                            print(f"  [{variant}]   beat-matched={recheck.beat_matched_score} "
+                                  f"(beats {recheck.localized_n_beats} vs {recheck.beat_matched_n_beats})  "
+                                  f"max-energy={recheck.energy_score} (overlap {recheck.energy_overlap})")
 
                 # Overlay generation: skipped entirely for a "Not Found" /
                 # unparseable answer (finding.where_intervals is empty/None)
