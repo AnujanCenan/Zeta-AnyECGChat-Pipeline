@@ -244,7 +244,9 @@ def cmd_chimera(args):
     trial_id = 0
     for cond in conds:
         ids = C.obs_ids(cond)
-        didx = np.flatnonzero(df[cond].values == 1)
+        # --donor-norm: control. Donors are NORMAL records, so transplanted beats carry no condition feature;
+        # whatever a method finds then is splice artefact / atypicality, not the observation.
+        didx = np.flatnonzero(df["NORM" if args.donor_norm else cond].values == 1)
         scored = []
         for i in C.rng.permutation(didx)[: max(args.trials * 3, args.trials)]:      # confident donors
             try:
@@ -256,6 +258,8 @@ def cmd_chimera(args):
             except Exception as e:
                 print(f"  donor {i}: {e!r}")
         scored.sort(reverse=True)
+        if args.donor_norm:
+            scored = [(0.0, i) for _, i in scored]        # any normal record; no confidence ranking
         donors = [i for _, i in scored[: args.trials]]
         for t_i, d_i in enumerate(donors):
             trial_id += 1
@@ -268,6 +272,8 @@ def cmd_chimera(args):
                 dpk = valid_peaks(donor, C.pre, C.post)
                 for _attempt in range(10):
                     h_i = int(C.rng.choice(hosts))
+                    if h_i == d_i:
+                        continue
                     host = C.read(df.loc[h_i])
                     hpk = valid_peaks(host, C.pre, C.post)
                     if len(hpk) >= 6 and len(dpk) >= max(args.k):
@@ -552,6 +558,9 @@ def build_parser():
     _add_common(c)
     c.add_argument("--trials", type=int, default=40, help="donor records per condition")
     c.add_argument("--k", type=int, nargs="+", default=[1, 3], help="beats transplanted per trial")
+    c.add_argument("--donor-norm", action="store_true",
+                   help="CONTROL: donor beats come from NORM records (no condition feature); methods that still "
+                        "'find' them are detecting the splice, not the observation")
     n = sub.add_parser("natural", help="per-beat occlusion on real labelled records (no ground truth)")
     _add_common(n)
     n.add_argument("--per-condition", type=int, default=20)
