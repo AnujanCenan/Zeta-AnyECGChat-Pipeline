@@ -60,10 +60,11 @@ import torch
 import zeta_relevance as Z
 
 METHODS = Z.ALL_METHODS
-BASELINES = ["qrs_oracle"]   # non-model reference: rank frames by detected-QRS proximity
+BASELINES = ["qrs_oracle", "qrs_center", "pwave_window", "twave_window"]   # non-model references
+SPEC_METHODS = ["chefer", "gradcam_cnn", "cross_attn_fixed"]   # the target-dependent ones
 # validated categorical slots 1-6 of the reference palette, fixed order (blue, orange, aqua, yellow, magenta, green)
 METHOD_COLOURS = dict(zip(METHODS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
-METHOD_COLOURS["qrs_oracle"] = "#6b6a66"   # neutral grey: a reference, not a candidate method
+METHOD_COLOURS.update({"qrs_oracle": "#6b6a66", "qrs_center": "#8f8e8a", "pwave_window": "#b3b2ae", "twave_window": "#4a4946"})   # greys: references, not candidates
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -266,12 +267,22 @@ def cmd_run(args, parser):
                     all_maps[i], logits[i] = Z.explain_pair(branch, model, x, ecg_out, b["pv"][i], b["nv"][i],
                                                            b["ps"][i], METHODS, args.target)
                 maps = dict(all_maps[idx])
-                if qrs_mask is not None:
-                    # reference ordering with no model in it: QRS windows first, random tie-break
-                    maps["qrs_oracle"] = qrs_mask.astype(float) + 1e-3 * np.random.RandomState(args.seed).rand(len(qrs_mask))
+                base_maps = Z.beat_baselines(x, spf, len(next(iter(maps.values()))), seed=args.seed)
+                if args.no_extra_baselines:
+                    base_maps = {k: v for k, v in base_maps.items() if k == "qrs_oracle"}
+                maps.update(base_maps)          # model-free reference orderings, scored like the methods
                 xsim = Z.cross_observation_similarity(all_maps) if len(obs_ids) > 1 else None
                 ev = Z.faithfulness(branch, x, maps, b["pv"][idx], b["nv"][idx], args.target,
                                     args.n_steps, args.n_random, seed=args.seed)
+                spec = None
+                if not args.no_specificity and len(obs_ids) > 1:
+                    spec = Z.observation_specificity(branch, x, all_maps, idx, b["pv"], b["nv"],
+                                                     SPEC_METHODS, args.target, args.n_steps)
+                lead = None
+                if not args.no_lead_attr:
+                    lead = Z.lead_attribution(branch, x, b["pv"][idx], b["nv"][idx], args.target,
+                                              frame_mask=qrs_mask, spf=spf)
+                    lead["names"] = Z.LEAD_NAMES_ZETA if args.lead_swap == "on" else Z.LEAD_NAMES
                 row = {"ecg_id": ecg_id, "strat_fold": int(by_id.loc[ecg_id, "strat_fold"]),
                        "condition": cond, "cond_score": cond_score, "obs_index": idx,
                        "obs_text": b["pos_t"][idx], "pair_score": probs[idx], "target_value": logits[idx],
@@ -280,7 +291,7 @@ def cmd_run(args, parser):
                        "qrs_frac": float(qrs_mask.mean()) if qrs_mask is not None else None,
                        "random": {"del_auc": ev["random"]["del_auc"], "ins_auc": ev["random"]["ins_auc"]},
                        "methods": row_metrics(maps, ev, qrs_mask, xsim), "agree": method_agreement(maps),
-                       "lead_swap": args.lead_swap}
+                       "lead_swap": args.lead_swap, "specificity": spec, "lead": lead}
                 f_res.write(json.dumps(clean(row)) + "\n")
                 f_res.flush()
                 if not args.no_save_maps:
@@ -446,6 +457,70 @@ def cmd_aggregate(args, parser):
             print(f"\nCascading randomisation, median Spearman vs original map over {SN.groupby(['ecg_id','condition']).ngroups} rows")
             print(SS)
 
+    # ---- observation specificity: own-observation map vs other observations' maps, same target
+    sp = []
+    for r in rows:
+        if not r.get("specificity") or r["range"] is None or r["range"] < args.min_range:
+            continue
+        for m, v in r["specificity"].items():
+            sp.append({"ecg_id": r["ecg_id"], "condition": r["condition"], "method": m,
+                       "spec_del_n": v["spec_del"] / r["range"], "spec_ins_n": v["spec_ins"] / r["range"]})
+    if sp:
+        SP = pd.DataFrame(sp)
+        e_sp = SP.groupby(["ecg_id", "method"])[["spec_del_n", "spec_ins_n"]].mean().reset_index()
+        out = []
+        for m in SPEC_METHODS:
+            e = e_sp[e_sp["method"] == m]
+            if len(e) == 0:
+                continue
+            row_ = {"method": m, "n_ecg": len(e)}
+            for c in ("spec_del_n", "spec_ins_n"):
+                lo, hi = boot_ci(e[c])
+                try:
+                    pv_ = float(wilcoxon(e[c]).pvalue)
+                except ValueError:
+                    pv_ = float("nan")
+                row_.update({c: float(e[c].mean()), c + "_lo": lo, c + "_hi": hi,
+                             c.replace("_n", "_win_rate"): float((e[c] > 0).mean()), c.replace("_n", "_p"): pv_})
+            out.append(row_)
+        SPS = pd.DataFrame(out).set_index("method")
+        SPS.to_csv(d / "specificity.csv")
+        with pd.option_context("display.width", 220, "display.max_columns", None, "display.float_format", "{:.3f}".format):
+            print("\nObservation specificity (normalised by full - blank; >0 = a map hurts/restores its OWN observation "
+                  "more than the other observations' maps do; rollout/attn_* are 0 by construction)")
+            print(SPS)
+    else:
+        print("\n(no rows with specificity: run without --no-specificity / --no-xobs)")
+
+    # ---- per-lead dependence
+    ld = []
+    for r in rows:
+        L = r.get("lead")
+        if not L:
+            continue
+        for i, nm in enumerate(L["names"]):
+            ld.append({"ecg_id": r["ecg_id"], "condition": r["condition"], "lead": nm,
+                       "occ_drop": L["occ_drop"][i], "only": L["only"][i], "gxi_share": L["gxi_share"][i],
+                       "occ_qrs_drop": (L["occ_qrs_drop"][i] if L.get("occ_qrs_drop") else np.nan)})
+    if ld:
+        LD = pd.DataFrame(ld)
+        lead_order = list(dict.fromkeys(LD["lead"]))
+        cols = ["occ_drop", "occ_qrs_drop", "only", "gxi_share"]
+        by = LD.groupby(["condition", "lead"])[cols].mean()
+        by["n"] = LD.groupby(["condition", "lead"])["ecg_id"].nunique()
+        by.to_csv(d / "lead_attribution.csv")
+        print("\nPer-lead dependence by condition (mean over records, target units). drop: score lost when the lead "
+              "is filled (necessity); QRS drop: filled inside QRS windows only; only: score kept when ONLY that lead "
+              f"is present (sufficiency); grad x input share is a first-order cross-check (chance {1 / len(lead_order):.2f})")
+        for c in sorted(LD["condition"].unique()):
+            t = by.loc[c]
+            top = lambda col: ", ".join(f"{k} {t.loc[k, col]:+.3f}" for k in t[col].nlargest(3).index)
+            v12 = (t.loc[["V1", "V2"], "occ_drop"].mean() - t.drop(["V1", "V2"])["occ_drop"].mean()
+                   if {"V1", "V2"} <= set(t.index) else float("nan"))
+            print(f"  {c:<10} n={int(t['n'].max()):<3} V1/V2 drop minus other leads {v12:+.3f} | "
+                  f"top drop: {top('occ_drop')} | top QRS drop: {top('occ_qrs_drop')}")
+        _lead_figure(by, lead_order, d / "lead_attribution.png")
+
     make_figure(S, mat, methods, d / "summary.png", n_ecg)
     print(f"\nWrote summary_by_method.csv, pairwise_wilcoxon.csv, by_condition.csv, method_agreement.csv, "
           f"{'sanity_summary.csv, ' if san else ''}summary.png to {d}")
@@ -549,6 +624,33 @@ def cmd_check_swap(args, parser):
         print(f"wrote {args.out}")
 
 
+def _lead_figure(by, lead_order, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    conds = sorted(by.index.get_level_values(0).unique())
+    M = np.array([[by.loc[(c, l), "occ_drop"] if (c, l) in by.index else np.nan for l in lead_order] for c in conds])
+    lim = float(np.nanmax(np.abs(M))) or 1.0
+    fig, a = plt.subplots(figsize=(8.5, 0.34 * len(conds) + 1.8), facecolor=SURFACE)
+    a.set_facecolor(SURFACE)
+    im = a.imshow(M, cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
+    a.set_xticks(range(len(lead_order)))
+    a.set_xticklabels(lead_order)
+    a.set_yticks(range(len(conds)))
+    a.set_yticklabels(conds)
+    for i in range(len(conds)):
+        for j in range(len(lead_order)):
+            if np.isfinite(M[i, j]):
+                a.text(j, i, f"{M[i, j]:.2f}", ha="center", va="center", fontsize=7,
+                       color="white" if abs(M[i, j]) > 0.6 * lim else INK)
+    a.set_title("Score lost when one lead is filled, by condition (red = lead supports the cited observation)",
+                loc="left", fontsize=10, color=INK)
+    fig.colorbar(im, ax=a, fraction=0.04, pad=0.02)
+    fig.tight_layout()
+    fig.savefig(path, dpi=140, facecolor=SURFACE)
+    plt.close(fig)
+
+
 def make_figure(S, mat, methods, path, n_ecg):
     import matplotlib
     matplotlib.use("Agg")
@@ -641,6 +743,12 @@ def build_parser():
     r.add_argument("--target", default="logit_diff", choices=["logit_diff", "pos_sim"])
     r.add_argument("--n-steps", type=int, default=20)
     r.add_argument("--n-random", type=int, default=5)
+    r.add_argument("--no-extra-baselines", action="store_true",
+                   help="only the qrs_oracle reference (skip qrs_center, pwave_window, twave_window)")
+    r.add_argument("--no-specificity", action="store_true",
+                   help="skip the own-map vs other-observation-map test (needs the cross-observation maps)")
+    r.add_argument("--no-lead-attr", action="store_true",
+                   help="skip per-lead occlusion (necessity, sufficiency, QRS-only) and gradient x input")
     r.add_argument("--no-xobs", action="store_true", help="skip the all-observations target-dependence check")
     r.add_argument("--sanity-every", type=int, default=0, help="cascading randomisation on every K-th row (0 = off)")
     r.add_argument("--no-save-maps", action="store_true")

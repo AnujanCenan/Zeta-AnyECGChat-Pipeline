@@ -584,6 +584,114 @@ def qrs_frame_mask(x_np, spf, n_frames, fs=SAMPLE_RATE, half_width_frames=3):
     return mask, len(pk)
 
 
+def beat_peaks(x_np, fs=SAMPLE_RATE):
+    """Sample indices of detected beats (same detector as qrs_frame_mask), or None if fewer than 3."""
+    from scipy.signal import find_peaks
+    e = np.convolve((np.diff(x_np, axis=1) ** 2).sum(0), np.ones(20) / 20, mode="same")
+    pk, _ = find_peaks(e, distance=int(0.4 * fs), height=np.percentile(e, 90))
+    return None if len(pk) < 3 else pk
+
+
+def beat_baselines(x_np, spf, n_frames, fs=SAMPLE_RATE, seed=0):
+    """Model-free reference orderings (not explanations). Each is a (n_frames,) score with a tiny
+    deterministic jitter so ties are broken the same way for every ECG:
+      qrs_oracle   QRS windows (+-3 frames) first
+      qrs_center   frames ranked by closeness to the beat centre (finer than the window)
+      pwave_window crude P window, 280-80 ms before the detected beat centre
+      twave_window crude T window, 100-450 ms after it
+    The P/T windows ignore heart rate and overlap at fast rates; treat them as rough controls.
+    Returns {} when fewer than 3 beats are found."""
+    pk = beat_peaks(x_np, fs)
+    if pk is None:
+        return {}
+    jit = 1e-3 * np.random.RandomState(seed).rand(n_frames)
+    idx = np.arange(n_frames)
+    centre = np.zeros(n_frames)
+    for q in pk:
+        centre = np.maximum(centre, np.clip(1.0 - np.abs(idx - q / spf) / 4.0, 0.0, None))
+    out = {"qrs_center": centre + jit}
+
+    def window(lo_s, hi_s):
+        m = np.zeros(n_frames, bool)
+        for q in pk:
+            a, b = int((q + lo_s * fs) // spf), int((q + hi_s * fs) // spf)
+            m[max(0, a): max(0, min(n_frames, b + 1))] = True
+        return m.astype(float) + jit
+
+    mask, _ = qrs_frame_mask(x_np, spf, n_frames, fs)
+    out["qrs_oracle"] = mask.astype(float) + jit
+    out["pwave_window"] = window(-0.28, -0.08)
+    out["twave_window"] = window(0.10, 0.45)
+    return out
+
+
+def lead_attribution(branch, x_np, pos_vec, neg_vec, target="logit_diff", frame_mask=None, spf=None):
+    """Which LEADS the target depends on (the relevance maps above are over time only). All fills use
+    the per-lead median, as in deletion. ZETA's first conv layer is followed by a GroupNorm over the
+    whole record, so filling a lead also rescales the others (non-local), and the score is nearly
+    invariant to scaling the whole ECG: Integrated Gradients from a constant baseline is therefore
+    degenerate here and is NOT used. Measures:
+    - occ_drop[l]:     target(full) - target(lead l filled)                (necessity)
+    - only[l]:         target(only lead l kept) - target(all filled)       (sufficiency)
+    - occ_qrs_drop[l]: target(full) - target(lead l filled inside the detected QRS windows only);
+                       None unless a frame mask is given (QRS evidence carried by that lead)
+    - gxi_share[l]:    |gradient x (x - median)| summed over time, as a share across leads (first-order,
+                       one backward pass; read it as a cross-check on occ_drop, not as a result by itself)."""
+    dev = next(branch.parameters()).device
+    x = torch.tensor(x_np, dtype=torch.float32, device=dev)
+    base = torch.median(x, dim=1, keepdim=True).values.expand_as(x).contiguous()
+    xc = x[None].clone().requires_grad_(True)
+    with torch.enable_grad():
+        vec, _ = branch.encode(xc)
+        g, = torch.autograd.grad(target_scalar(vec, pos_vec, neg_vec, target).sum(), xc)
+    gx = (g[0] * (x - base)).abs().sum(1).cpu().numpy()
+    with torch.no_grad():
+        def tv(batch):
+            return _batched_target(branch, batch, pos_vec, neg_vec, target)
+        ends = tv(torch.stack([x, base]))
+        occ, only = [], []
+        for l in range(x.shape[0]):
+            o = x.clone(); o[l] = base[l]; occ.append(o)
+            k = base.clone(); k[l] = x[l]; only.append(k)
+        occ_t, only_t = tv(torch.stack(occ)), tv(torch.stack(only))
+        occ_q = None
+        if frame_mask is not None and spf is not None:
+            sm = np.zeros(x.shape[1], bool)
+            sm[:len(frame_mask) * spf] = np.repeat(frame_mask, spf)
+            sm = torch.tensor(sm, device=dev)
+            qs = []
+            for l in range(x.shape[0]):
+                o = x.clone(); o[l] = torch.where(sm, base[l], x[l]); qs.append(o)
+            occ_q = (ends[0] - tv(torch.stack(qs))).tolist()
+    return {"gxi_share": (gx / max(gx.sum(), 1e-12)).tolist(),
+            "occ_drop": (ends[0] - occ_t).tolist(), "only": (only_t - ends[1]).tolist(),
+            "occ_qrs_drop": occ_q, "full": float(ends[0]), "blank": float(ends[1])}
+
+
+def observation_specificity(branch, x_np, maps_by_obs, a, pos_vecs, neg_vecs, methods,
+                            target="logit_diff", n_steps=20):
+    """Does a method's map for observation `a` hurt observation a's own score more than the maps for
+    the OTHER observations on the same ECG do? Same target (a), different maps.
+      spec_del = mean_j [del_auc(map_j) - del_auc(map_a)]   > 0: own map damages the target more
+      spec_ins = mean_j [ins_auc(map_a) - ins_auc(map_j)]   > 0: own map restores the target more
+    Raw logit units (the caller normalises by |full - blank|). Methods whose maps do not depend on
+    the observation give exactly 0 by construction, so only pass target-dependent ones."""
+    others = [j for j in maps_by_obs if j != a]
+    if not others:
+        return None
+    rel = {}
+    for m in methods:
+        for j in [a] + others:
+            rel[f"{m}@{j}"] = maps_by_obs[j][m]
+    ev = faithfulness(branch, x_np, rel, pos_vecs[a], neg_vecs[a], target, n_steps, n_random=1)
+    out = {}
+    for m in methods:
+        own = ev[f"{m}@{a}"]
+        out[m] = {"spec_del": float(np.mean([ev[f"{m}@{j}"]["del_auc"] - own["del_auc"] for j in others])),
+                  "spec_ins": float(np.mean([own["ins_auc"] - ev[f"{m}@{j}"]["ins_auc"] for j in others]))}
+    return out
+
+
 def parse_intervals(s):
     return [tuple(float(v) for v in part.split("-")) for part in s.split(",") if part.strip()]
 
@@ -623,6 +731,11 @@ def main():
     p.add_argument("--n-steps", type=int, default=20)
     p.add_argument("--n-random", type=int, default=10)
     p.add_argument("--sanity", action="store_true", help="cascading weight-randomisation check")
+    p.add_argument("--lead-attr", action="store_true",
+                   help="per-lead importance for the cited observation (Integrated Gradients + lead occlusion)")
+    p.add_argument("--specificity", action="store_true",
+                   help="with --all-obs: does each target-dependent map hurt its OWN observation more than "
+                        "the other observations' maps do? (cited observation only)")
     p.add_argument("--gt-intervals", default=None, help='seconds, e.g. "2.1-3.4,5.0-6.2"')
     p.add_argument("--lead-swap", choices=["on", "off"], default="on",
                    help="swap aVL/aVF into MIMIC order (ZETA's pretraining order); check on a subset "
@@ -693,6 +806,33 @@ def main():
         for k, v in ev.items():
             if not k.startswith("_"):
                 print(f"  {k:<18} del {v['del_auc']:8.3f}   ins {v['ins_auc']:8.3f}")
+
+    names = LEAD_NAMES_ZETA if args.lead_swap == "on" else LEAD_NAMES
+    if args.lead_attr:
+        fm, _ = qrs_frame_mask(x, spf, len(next(iter(maps.values()))))
+        la = lead_attribution(branch, x, pv[idx], nv[idx], args.target, frame_mask=fm, spf=spf)
+        la["names"] = names
+        report["lead_attribution"] = la
+        print(f"\nPer-lead dependence of the cited observation (full={la['full']:.3f}, all-filled={la['blank']:.3f}):")
+        print("  " + "lead".ljust(6) + "drop if filled".rjust(16) + "drop (QRS only)".rjust(17)
+              + "score if only".rjust(15) + "grad x input".rjust(14))
+        for l, nm in enumerate(names):
+            q = f"{la['occ_qrs_drop'][l]:17.3f}" if la["occ_qrs_drop"] else "n/a".rjust(17)
+            print(f"  {nm:<6}{la['occ_drop'][l]:16.3f}{q}{la['only'][l]:15.3f}{la['gxi_share'][l]:14.3f}")
+        print(f"  (chance share for grad x input = {1 / len(names):.3f}/lead; drops are in target units, "
+              f"so compare them with full - blank = {la['full'] - la['blank']:.3f})")
+
+    if args.specificity:
+        if len(obs_ids) < 2:
+            print("\n--specificity needs --all-obs (at least 2 observations)")
+        else:
+            tdep = [m for m in args.methods if m in ("chefer", "gradcam_cnn", "cross_attn_fixed")]
+            sp = observation_specificity(branch, x, all_maps, idx, pv, nv, tdep, args.target, args.n_steps)
+            report["specificity"] = sp
+            print("\nObservation specificity on the cited observation (>0: its own map hurts/restores its own "
+                  "score more than the other observations' maps; rollout/attn_* are 0 by construction):")
+            for m_, v in sp.items():
+                print(f"  {m_:<18} spec_del {v['spec_del']:8.3f}   spec_ins {v['spec_ins']:8.3f}")
 
     if args.sanity:
         rows = sanity_cascade(branch, x, pv[idx], nv[idx], args.target)
