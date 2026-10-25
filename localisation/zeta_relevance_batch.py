@@ -874,6 +874,317 @@ def make_figure(S, mat, methods, path, n_ecg):
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# localise: per-OBSERVATION maps over PTB-XL (the "final product" run)
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOC_BASELINES = ["qrs_oracle", "qrs_center", "energy"]
+
+
+def localise_figure(x, spf, lead_names, ecg_id, cond, cond_score, obs_texts, pair_scores, chefer_maps, base_map, path):
+    """ECG traces (II, V1, V5) with the best-scoring observation's Chefer map shaded, then one strip per
+    observation (its own Chefer map, rescaled 0-1 within the strip) and a beat-baseline strip."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import textwrap
+
+    T = x.shape[1]
+    t = np.arange(T) / Z.SAMPLE_RATE
+    ids = sorted(chefer_maps)
+    best = max(ids, key=lambda i: pair_scores[i])
+    leads = [1, 6, 10]
+    n = len(ids) + 1
+    fig, axes = plt.subplots(len(leads) + n, 1, figsize=(14, 1.1 * len(leads) + 0.55 * n + 1.6), sharex=True,
+                             gridspec_kw={"height_ratios": [2.2] * len(leads) + [0.8] * n})
+
+    def img(rel):
+        r = np.asarray(rel, float)
+        r = (r - r.min()) / (r.max() - r.min() + 1e-12)
+        return np.repeat(r, spf)[None, :]
+
+    for a, l in zip(axes[:len(leads)], leads):
+        a.imshow(img(chefer_maps[best]), aspect="auto", cmap="Reds", alpha=0.5, zorder=0,
+                 extent=[0, len(chefer_maps[best]) * spf / Z.SAMPLE_RATE, x[l].min(), x[l].max()])
+        a.plot(t, x[l], color="#0b0b0b", lw=0.8, zorder=2)
+        a.set_ylabel(lead_names[l], rotation=0, ha="right", va="center")
+        a.set_yticks([])
+        a.set_xlim(0, T / Z.SAMPLE_RATE)
+    axes[0].set_title(f"ECG {ecg_id}  |  {cond}  |  condition score {cond_score:.2f}  |  shading = Chefer map for "
+                      f"\"{obs_texts[best][:70]}\"", fontsize=10, loc="left")
+    for a, i in zip(axes[len(leads):-1], ids):
+        a.imshow(img(chefer_maps[i]), aspect="auto", cmap="magma", extent=[0, len(chefer_maps[i]) * spf / Z.SAMPLE_RATE, 0, 1])
+        a.set_yticks([])
+        lab = textwrap.shorten(obs_texts[i], 46, placeholder="...") + f"  ({pair_scores[i]:.2f})"
+        a.set_ylabel(lab, rotation=0, ha="right", va="center", fontsize=7.5)
+    if base_map is not None:
+        axes[-1].imshow(img(base_map), aspect="auto", cmap="Greys", extent=[0, len(base_map) * spf / Z.SAMPLE_RATE, 0, 1])
+    axes[-1].set_yticks([])
+    axes[-1].set_ylabel("QRS windows\n(model-free)", rotation=0, ha="right", va="center", fontsize=7.5)
+    axes[-1].set_xlabel("time (s)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=120)
+    plt.close(fig)
+
+
+def cmd_localise(args, parser):
+    import pandas as pd
+
+    Z.resolve_repo(parser, args)
+    if not args.ptbxl_root or not (Path(args.ptbxl_root) / "records500").is_dir():
+        raise SystemExit("PTB-XL folder not found: pass --ptbxl_root or set PTBXL_DATASET in .env. Got: %r" % args.ptbxl_root)
+    from transformers import T5TokenizerFast
+
+    out_dir = Path(args.out)
+    for sub_ in ("maps", "figures"):
+        (out_dir / sub_).mkdir(parents=True, exist_ok=True)
+    s_i, s_n = (int(v) for v in args.shard.split("/"))
+    tag = f"shard{s_i}of{s_n}"
+    csv = args.csv or str(Path(args.repo).expanduser() / "data_split" / "ptbxl" / args.split /
+                          f"ptbxl_{args.split}_test.csv")
+    df = pd.read_csv(csv)
+    df = df[df["strat_fold"].isin(args.folds)].reset_index(drop=True)
+    with open(args.observations) as f:
+        obs = json.load(f)
+    label_cols = [c for c in df.columns[6:] if c in obs]
+    conds = [c for c in (args.conditions or label_cols) if c in label_cols and c not in args.skip]
+    allowed = load_obs_filter(args.obs_filter, args.min_obs_auroc) if args.obs_filter else None
+    if allowed is not None:
+        conds = [c for c in conds if c in allowed]
+        print("observations kept by --obs-filter: " + "; ".join(f"{c}: {allowed[c]}" for c in conds))
+    print(f"{len(df)} records; conditions: {conds}; methods: {args.methods}")
+
+    dev = torch.device(args.device)
+    model = Z.load_model(args.config, args.checkpoint, dev)
+    tok = T5TokenizerFast.from_pretrained("google/flan-t5-base", do_lower_case=True)
+    branch = Z.ECGBranch.from_model(model)
+    spf, nf_fn = Z.frame_geometry(branch)
+    bank = TextBank(model, tok, obs, dev)
+    swap = args.lead_swap == "on"
+    lead_names = Z.LEAD_NAMES_ZETA if swap else Z.LEAD_NAMES
+    rng = np.random.RandomState(args.seed)
+
+    def obs_list(c, n_pairs):
+        return [k for k in (allowed[c] if allowed is not None else range(n_pairs)) if k < n_pairs]
+
+    jobs = {}
+    for c in conds:
+        idx = np.flatnonzero(df[c].values == 1)
+        n_cand = (args.candidates or 4 * args.per_condition) if args.select == "top" else args.per_condition
+        if n_cand and len(idx) > n_cand:
+            idx = rng.choice(idx, n_cand, replace=False)
+        if args.select == "top":
+            scored = []
+            for i in idx:
+                try:
+                    x_ = Z.read_ptbxl(args.ptbxl_root, df.loc[i, "filename_hr"], swap)
+                    with torch.no_grad():
+                        v_, _ = branch.encode(torch.tensor(x_, dtype=torch.float32, device=dev).unsqueeze(0))
+                    pp = pair_probs(v_, bank.get(c))
+                    scored.append((float(np.mean([pp[k] for k in obs_list(c, len(pp))])), int(df.loc[i, "ecg_id"])))
+                except Exception as e:
+                    print(f"  candidate {df.loc[i, 'ecg_id']} ({c}): {e!r}")
+            scored.sort(reverse=True)
+            idx_ids = [e for _, e in scored[:args.per_condition]]
+        else:
+            idx_ids = [int(df.loc[i, "ecg_id"]) for i in idx]
+        for e in idx_ids:
+            jobs.setdefault(e, []).append(c)
+    print(f"{sum(len(v) for v in jobs.values())} (ECG, condition) pairs over {len(jobs)} ECGs")
+    by_id = df.set_index("ecg_id")
+    items = sorted(jobs.items())[s_i::s_n]
+    done = set()
+    for f in glob.glob(str(out_dir / "observations*.jsonl")):
+        for line in open(f):
+            try:
+                r = json.loads(line)
+                done.add((int(r["ecg_id"]), r["condition"]))
+            except Exception:
+                pass
+    fig_count = {}
+    for p_ in (out_dir / "figures").glob("*.png"):
+        fig_count[p_.name.split("_")[1]] = fig_count.get(p_.name.split("_")[1], 0) + 1
+
+    f_obs = open(out_dir / f"observations_{tag}.jsonl", "a")
+    f_err = open(out_dir / f"errors_{tag}.jsonl", "a")
+    n_rows, t0 = 0, time.time()
+    for k, (ecg_id, want) in enumerate(items):
+        if args.max_rows and n_rows >= args.max_rows:
+            break
+        try:
+            x = Z.read_ptbxl(args.ptbxl_root, by_id.loc[ecg_id, "filename_hr"], swap)
+            with torch.no_grad():
+                vec, ecg_out = branch.encode(torch.tensor(x, dtype=torch.float32, device=dev).unsqueeze(0))
+            qrs_mask, n_beats = Z.qrs_frame_mask(x, spf, nf_fn(x.shape[1]))
+            for cond in want:
+                if (ecg_id, cond) in done:
+                    continue
+                b = bank.get(cond)
+                probs = pair_probs(vec, b)
+                cond_score = float(np.mean(probs))
+                if cond_score < args.min_cond_score:
+                    continue
+                maps_by_obs, rows, store = {}, [], {}
+                base_all = None
+                for i in obs_list(cond, len(probs)):
+                    mp, logit = Z.explain_pair(branch, model, x, ecg_out, b["pv"][i], b["nv"][i], b["ps"][i],
+                                               args.methods, args.target)
+                    n_fr = len(next(iter(mp.values())))
+                    if base_all is None:
+                        base_all = Z.beat_baselines(x, spf, n_fr, seed=args.seed)
+                    maps = dict(mp)
+                    maps.update({m: v for m, v in base_all.items() if m in LOC_BASELINES})
+                    ev = Z.faithfulness(branch, x, maps, b["pv"][i], b["nv"][i], args.target,
+                                        args.n_steps, args.n_random, seed=args.seed)
+                    rows.append({"ecg_id": ecg_id, "condition": cond, "cond_score": cond_score, "obs_index": i,
+                                 "obs_text": b["pos_t"][i], "pair_score": probs[i], "target_value": logit,
+                                 "range": ev["_full"] - ev["_blank"], "n_beats": n_beats,
+                                 "methods": row_metrics(maps, ev, qrs_mask, None)})
+                    maps_by_obs[i] = mp.get("chefer", next(iter(mp.values())))
+                    for m, v in maps.items():
+                        store[f"o{i}_{m}"] = np.asarray(v).astype(np.float16)
+                for r in rows:
+                    f_obs.write(json.dumps(clean(r)) + "\n")
+                f_obs.flush()
+                if not args.no_save_maps and store:
+                    np.savez_compressed(out_dir / "maps" / f"{ecg_id}_{cond.replace('/', '-')}.npz", spf=spf, **store)
+                n_rows += len(rows)
+                safe = cond.replace("/", "-")
+                if maps_by_obs and fig_count.get(safe, 0) < args.figures:
+                    texts = {r["obs_index"]: r["obs_text"] for r in rows}
+                    ps = {r["obs_index"]: r["pair_score"] for r in rows}
+                    localise_figure(x, spf, lead_names, ecg_id, cond, cond_score, texts, ps, maps_by_obs,
+                                    base_all.get("qrs_oracle") if base_all else None,
+                                    out_dir / "figures" / f"ecg_{safe}_{ecg_id}.png")
+                    fig_count[safe] = fig_count.get(safe, 0) + 1
+        except Exception as e:  # keep the batch alive
+            f_err.write(json.dumps({"ecg_id": ecg_id, "error": repr(e), "trace": traceback.format_exc()[-800:]}) + "\n")
+            f_err.flush()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"  ECG {ecg_id}: {e!r} (logged)")
+        if (k + 1) % 10 == 0 or k + 1 == len(items):
+            el = time.time() - t0
+            print(f"[{tag}] ECG {k + 1}/{len(items)}  observation rows this run: {n_rows}  "
+                  f"{el / 60:.1f} min elapsed, ~{el / (k + 1) * (len(items) - k - 1) / 60:.0f} min left", flush=True)
+    f_obs.close()
+    f_err.close()
+    print(f"done: {n_rows} observation rows -> {out_dir}/observations_{tag}.jsonl")
+    if s_n == 1:
+        summarise_localise(out_dir, args.min_range, args.obs_auroc)
+
+
+def _paired_ci(a, b):
+    d = np.asarray(a, float) - np.asarray(b, float)
+    d = d[np.isfinite(d)]
+    return (float(d.mean()), *boot_ci(d)) if len(d) >= 2 else (float("nan"),) * 3
+
+
+def summarise_localise(d, min_range=0.05, obs_auroc=None, min_n=8):
+    """One row per (condition, observation): does each model-internal map beat random, and beat the best
+    model-free baseline, on deletion AND insertion (paired by ECG, bootstrap CI)?"""
+    import pandas as pd
+    d = Path(d)
+    rows = []
+    for f in sorted(glob.glob(str(d / "observations*.jsonl"))):
+        rows += [json.loads(line) for line in open(f) if line.strip()]
+    if not rows:
+        raise SystemExit(f"no observations*.jsonl in {d}")
+    recs = []
+    for r in rows:
+        rg = r["range"] if r["range"] is not None else float("nan")
+        if not rg >= min_range:
+            continue
+        for m, v in r["methods"].items():
+            recs.append({"ecg_id": r["ecg_id"], "condition": r["condition"], "obs_index": r["obs_index"],
+                         "obs_text": r["obs_text"], "pair_score": r["pair_score"], "method": m,
+                         "del_n": (v["del_adv"] or np.nan) / rg, "ins_n": (v["ins_adv"] or np.nan) / rg,
+                         "qrs_auroc": v.get("qrs_auroc")})
+    df = pd.DataFrame(recs)
+    print(f"{len(rows)} observation rows; {df.groupby(['ecg_id', 'condition', 'obs_index']).ngroups} usable "
+          f"(full - blank >= {min_range})")
+    model_methods = [m for m in METHODS if m in set(df["method"])]
+    bases = [m for m in LOC_BASELINES if m in set(df["method"])]
+    auc = None
+    if obs_auroc:
+        auc = pd.read_csv(obs_auroc).set_index(["condition", "obs_index"])["auroc_pair"].to_dict()
+    out = []
+    for (c, i), g in df.groupby(["condition", "obs_index"]):
+        piv_d = g.pivot_table(index="ecg_id", columns="method", values="del_n")
+        piv_i = g.pivot_table(index="ecg_id", columns="method", values="ins_n")
+        row = {"condition": c, "obs_index": i, "obs_text": g["obs_text"].iloc[0], "n_ecg": piv_d.shape[0],
+               "mean_pair_score": float(g["pair_score"].mean())}
+        if auc is not None:
+            row["auroc_pair"] = auc.get((c, i))
+        best_b = max(bases, key=lambda m: piv_d[m].mean()) if bases else None
+        row["best_baseline"] = best_b
+        for m in bases:
+            row[f"{m}_del"], row[f"{m}_ins"] = float(piv_d[m].mean()), float(piv_i[m].mean())
+        for m in model_methods:
+            md, mlo, mhi = _paired_ci(piv_d[m], 0.0)
+            mi, ilo, ihi = _paired_ci(piv_i[m], 0.0)
+            row[f"{m}_del"], row[f"{m}_del_lo"], row[f"{m}_del_hi"] = md, mlo, mhi
+            row[f"{m}_ins"], row[f"{m}_ins_lo"], row[f"{m}_ins_hi"] = mi, ilo, ihi
+            if best_b:
+                bd, bdlo, bdhi = _paired_ci(piv_d[m], piv_d[best_b])
+                bi, bilo, bihi = _paired_ci(piv_i[m], piv_i[best_b])
+                row[f"{m}_vs_base_del"], row[f"{m}_vs_base_del_lo"] = bd, bdlo
+                row[f"{m}_vs_base_ins"], row[f"{m}_vs_base_ins_lo"] = bi, bilo
+                above_r = mlo > 0 and ilo > 0
+                above_b = bdlo > 0 and bilo > 0
+                half_r = (mlo > 0) != (ilo > 0)
+                row[f"{m}_verdict"] = ("too few ECGs" if row["n_ecg"] < min_n else
+                                       "beats baseline" if (above_b and above_r) else
+                                       "above random only" if above_r else
+                                       "mixed (one metric)" if half_r else "not above random")
+        out.append(row)
+    T = pd.DataFrame(out).sort_values(["condition", "obs_index"])
+    T.to_csv(d / "observation_table.csv", index=False)
+    show = ["condition", "obs_index", "obs_text", "n_ecg"] + (["auroc_pair"] if auc is not None else []) + \
+           [c for c in ("chefer_del", "chefer_ins", "rollout_del", "rollout_ins", "energy_del", "qrs_oracle_del",
+                        "chefer_verdict", "rollout_verdict") if c in T]
+    with pd.option_context("display.width", 250, "display.max_columns", None, "display.max_colwidth", 44,
+                           "display.float_format", "{:.2f}".format):
+        print(T[show].to_string(index=False))
+    for m in model_methods:
+        if f"{m}_verdict" in T:
+            print(f"\n{m}: " + ", ".join(f"{k}: {v}" for k, v in T[f'{m}_verdict'].value_counts().items()))
+    _localise_forest(T, model_methods, d / "observation_forest.png")
+    print(f"\nwrote {d}/observation_table.csv, {d}/observation_forest.png")
+    return T
+
+
+def _localise_forest(T, methods, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import textwrap
+    ms = [m for m in methods if f"{m}_vs_base_del" in T][:2]
+    if not ms:
+        return
+    T = T[T["n_ecg"] >= 2].reset_index(drop=True)
+    fig, axes = plt.subplots(1, len(ms), figsize=(6.5 * len(ms) + 3, 0.28 * len(T) + 1.8), sharey=True)
+    axes = np.atleast_1d(axes)
+    y = np.arange(len(T))[::-1]
+    for ax, m in zip(axes, ms):
+        v, lo = T[f"{m}_vs_base_del"].values, T[f"{m}_vs_base_del_lo"].values
+        iv, ilo = T[f"{m}_vs_base_ins"].values, T[f"{m}_vs_base_ins_lo"].values
+        ax.axvline(0, color=GRID if False else "#6b6a66", lw=1)
+        ax.scatter(v, y + 0.12, color=METHOD_COLOURS[m], s=22, label="deletion", zorder=3)
+        ax.scatter(iv, y - 0.12, color="#6b6a66", s=22, marker="s", label="insertion", zorder=3)
+        ax.hlines(y + 0.12, lo, v + (v - lo), color=METHOD_COLOURS[m], lw=1.2)
+        ax.hlines(y - 0.12, ilo, iv + (iv - ilo), color="#6b6a66", lw=1.2)
+        ax.set_title(f"{m} minus best model-free baseline\n(right of 0 = beats the baseline)", fontsize=9, loc="left")
+        ax.set_xlabel("normalised advantage difference (95% CI, paired by ECG)")
+        ax.set_yticks(y)
+        ax.set_yticklabels([f"{c}: " + textwrap.shorten(t, 40, placeholder="...")
+                            for c, t in zip(T["condition"], T["obs_text"])], fontsize=7)
+        ax.legend(fontsize=7, loc="lower right", frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -924,6 +1235,44 @@ def build_parser():
     r.add_argument("--max-rows", type=int, default=0, help="stop after this many rows (for timing/tests)")
     r.add_argument("--seed", type=int, default=0)
     r.add_argument("--out", required=True)
+
+    l = sub.add_parser("localise", help="per-OBSERVATION maps over PTB-XL (chefer/rollout vs model-free baselines)")
+    l.add_argument("--split", default="sub_class", choices=["sub_class", "super_class", "form", "rhythm"])
+    l.add_argument("--csv", default=None)
+    l.add_argument("--folds", type=int, nargs="+", default=[10])
+    l.add_argument("--ptbxl_root", default=os.getenv("PTBXL_DATASET"))
+    l.add_argument("--checkpoint", default=os.getenv("CHECKPOINT_PATH"))
+    l.add_argument("--config", default="configs/config.json")
+    l.add_argument("--observations", default="configs/observations.json")
+    l.add_argument("--repo", default=os.getenv("ZETA_REPO") or os.getenv("ZETA_REPO_ROOT"))
+    l.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    l.add_argument("--lead-swap", choices=["on", "off"], default="on")
+    l.add_argument("--conditions", nargs="+", default=None)
+    l.add_argument("--skip", nargs="*", default=["NORM", "SR"])
+    l.add_argument("--methods", nargs="+", default=["chefer", "rollout"], choices=Z.ALL_METHODS)
+    l.add_argument("--select", choices=["random", "top"], default="top",
+                   help="top = most confidently detected labelled records per condition (default)")
+    l.add_argument("--candidates", type=int, default=0, help="--select top: candidates scored per condition (default 4x per-condition)")
+    l.add_argument("--per-condition", type=int, default=30)
+    l.add_argument("--min-cond-score", type=float, default=0.0)
+    l.add_argument("--target", default="logit_diff", choices=["logit_diff", "pos_sim"])
+    l.add_argument("--n-steps", type=int, default=20)
+    l.add_argument("--n-random", type=int, default=5)
+    l.add_argument("--obs-filter", default=None, help="obs_auroc.csv: keep only observations with pair AUROC >= --min-obs-auroc")
+    l.add_argument("--min-obs-auroc", type=float, default=0.75)
+    l.add_argument("--obs-auroc", default=None, help="obs_auroc.csv, only to show each observation's AUROC in the table")
+    l.add_argument("--min-range", type=float, default=0.05)
+    l.add_argument("--figures", type=int, default=3, help="example figures per condition")
+    l.add_argument("--no-save-maps", action="store_true")
+    l.add_argument("--shard", default="0/1")
+    l.add_argument("--max-rows", type=int, default=0, help="stop after this many observation rows (timing/tests)")
+    l.add_argument("--seed", type=int, default=0)
+    l.add_argument("--out", required=True)
+
+    ls = sub.add_parser("localise-summary", help="(re)build observation_table.csv / forest plot from observations*.jsonl")
+    ls.add_argument("--dir", required=True)
+    ls.add_argument("--min-range", type=float, default=0.05)
+    ls.add_argument("--obs-auroc", default=None)
 
     a = sub.add_parser("aggregate", help="summarise results*.jsonl into tables and a figure")
     a.add_argument("--dir", required=True)
@@ -984,6 +1333,10 @@ def main(argv=None):
         cmd_check_swap(args, p)
     elif args.cmd == "obs-auroc":
         cmd_obs_auroc(args, p)
+    elif args.cmd == "localise":
+        cmd_localise(args, p)
+    elif args.cmd == "localise-summary":
+        summarise_localise(args.dir, args.min_range, args.obs_auroc)
     else:
         cmd_aggregate(args, p)
 
