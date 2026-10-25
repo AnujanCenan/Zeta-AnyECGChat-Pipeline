@@ -597,19 +597,24 @@ def beat_baselines(x_np, spf, n_frames, fs=SAMPLE_RATE, seed=0):
     deterministic jitter so ties are broken the same way for every ECG:
       qrs_oracle   QRS windows (+-3 frames) first
       qrs_center   frames ranked by closeness to the beat centre (finer than the window)
+      energy       local signal energy per frame (squared first difference, summed over leads): the
+                   model-free "where does the signal change most" saliency; qrs_center may just track it
       pwave_window crude P window, 280-80 ms before the detected beat centre
       twave_window crude T window, 100-450 ms after it
     The P/T windows ignore heart rate and overlap at fast rates; treat them as rough controls.
     Returns {} when fewer than 3 beats are found."""
     pk = beat_peaks(x_np, fs)
-    if pk is None:
-        return {}
     jit = 1e-3 * np.random.RandomState(seed).rand(n_frames)
+    e_raw = np.concatenate([(np.diff(x_np, axis=1) ** 2).sum(0), [0.0]])[:n_frames * spf]
+    e_fr = e_raw.reshape(n_frames, spf).mean(1)
+    energy = e_fr / (e_fr.max() + 1e-12) + jit
+    if pk is None:
+        return {"energy": energy}
     idx = np.arange(n_frames)
     centre = np.zeros(n_frames)
     for q in pk:
         centre = np.maximum(centre, np.clip(1.0 - np.abs(idx - q / spf) / 4.0, 0.0, None))
-    out = {"qrs_center": centre + jit}
+    out = {"qrs_center": centre + jit, "energy": energy}
 
     def window(lo_s, hi_s):
         m = np.zeros(n_frames, bool)

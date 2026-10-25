@@ -61,11 +61,11 @@ import torch
 import zeta_relevance as Z
 
 METHODS = Z.ALL_METHODS
-BASELINES = ["qrs_oracle", "qrs_center", "pwave_window", "twave_window"]   # non-model references
+BASELINES = ["qrs_oracle", "qrs_center", "energy", "pwave_window", "twave_window"]   # non-model references
 SPEC_METHODS = ["chefer", "gradcam_cnn", "cross_attn_fixed"]   # the target-dependent ones
 # validated categorical slots 1-6 of the reference palette, fixed order (blue, orange, aqua, yellow, magenta, green)
 METHOD_COLOURS = dict(zip(METHODS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"]))
-METHOD_COLOURS.update({"qrs_oracle": "#6b6a66", "qrs_center": "#8f8e8a", "pwave_window": "#b3b2ae", "twave_window": "#4a4946"})   # greys: references, not candidates
+METHOD_COLOURS.update({"qrs_oracle": "#6b6a66", "qrs_center": "#8f8e8a", "energy": "#9b6b3a", "pwave_window": "#b3b2ae", "twave_window": "#4a4946"})   # greys: references, not candidates
 SURFACE, INK, INK2, GRID = "#fcfcfb", "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -541,7 +541,7 @@ def cmd_aggregate(args, parser):
         WI = pd.DataFrame(wi)
         e_w = WI.groupby(["ecg_id", "method"])[["w_del_n", "w_ins_n"]].mean().reset_index()
         out = []
-        for m in [m for m in METHODS + ["qrs_center"] if m in set(e_w["method"])]:
+        for m in [m for m in METHODS + ["qrs_center", "energy"] if m in set(e_w["method"])]:
             e = e_w[e_w["method"] == m]
             row_ = {"method": m, "n_ecg": len(e)}
             for c in ("w_del_n", "w_ins_n"):
