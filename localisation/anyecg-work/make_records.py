@@ -2,11 +2,11 @@
 """Generate records.txt for run_pipeline.py from MIT-BIH .atr annotations.
 
 Usage: python make_records.py [--root /path/to/MIT_BIH]  (or set MITBIH_ROOT in .env) [--per-class 5] [--out records.txt]
-Needs: pip install wfdb. Writes one absolute record path per line (no extension).
+No wfdb needed (own .atr reader; wfdb breaks on some numpy 2 installs). Writes one absolute record path per line (no extension).
 Selection (from beat annotations): LBBB = mostly 'L' beats, RBBB = mostly 'R',
 PVC = >=100 'V' beats with the rest mostly 'N', NORM = all 'N' and ~no V/A/L/R.
 """
-import argparse, collections, os, wfdb
+import argparse, collections, os, struct
 from pathlib import Path
 try:
     from dotenv import load_dotenv
@@ -23,11 +23,36 @@ a = ap.parse_args()
 if not a.root:
     ap.error("Set MITBIH_ROOT in .env or pass --root.")
 
+SYM = {1: "N", 2: "L", 3: "R", 4: "a", 5: "V", 6: "F", 7: "J", 8: "A", 9: "S",
+       10: "E", 11: "j", 12: "/", 13: "Q", 34: "e"}
+
+
+def read_atr_symbols(path):
+    """Beat-symbol list from a MIT-BIH .atr file (16-bit LE words: code<<10 | data)."""
+    b = open(path, "rb").read()
+    i, out = 0, []
+    while i + 2 <= len(b):
+        w = struct.unpack_from("<H", b, i)[0]
+        i += 2
+        code, data = w >> 10, w & 1023
+        if code == 0 and data == 0:
+            break
+        if code == 59:      # SKIP: 4-byte interval follows
+            i += 4
+        elif code in (60, 61, 62):   # NUM / SUB / CHN
+            pass
+        elif code == 63:    # AUX: `data` bytes, padded to even
+            i += data + (data & 1)
+        elif code in SYM:
+            out.append(SYM[code])
+    return out
+
+
 rows = {}
 for f in sorted(os.listdir(a.root)):
     if f.endswith(".atr"):
         r = f[:-4]
-        c = collections.Counter(wfdb.rdann(os.path.join(a.root, r), "atr").symbol)
+        c = collections.Counter(read_atr_symbols(os.path.join(a.root, f)))
         beats = sum(c[k] for k in "NLRVAaJjSEFfQe")
         rows[r] = (c, max(beats, 1))
 
