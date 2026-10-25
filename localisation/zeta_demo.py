@@ -35,7 +35,7 @@ import zeta_relevance_batch as B
 import zeta_beat_occlusion as BO
 
 FS = Z.SAMPLE_RATE
-CAVEAT = ("Beat-level evidence only. Rollout shows which beats the model attends to as atypical (same for every observation); "
+CAVEAT = ("Beat-level evidence only. Rollout shows relative attention across beats (same for every observation; in the chimera test it ranked transplanted abnormal beats highly); "
           "occlusion shows how much each observation's score falls when a beat is removed. Neither localises within a beat, "
           "and neither is validated against clinical annotation.")
 
@@ -53,7 +53,7 @@ def beat_sentence(text, score, drops, peaks, top_n=2, min_drop=0.05):
             f'the top beat carries {share:.0%} of the total drop (equal share would be {1 / len(peaks):.0%}).')
 
 
-def make_figure(x, peaks, pre, post, rollout, occ, texts, scores, title, path, lead_names):
+def make_figure(x, peaks, pre, post, rollout, occ, texts, scores, title, path, lead_names, z_flag=1.5, vmax_min=0.15):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -81,22 +81,22 @@ def make_figure(x, peaks, pre, post, rollout, occ, texts, scores, title, path, l
         ax1.axvspan((p - pre) / FS, (p + post) / FS, color="#eb6834", alpha=float(np.clip(0.08 + 0.18 * max(rz[j], 0), 0, 0.6)), lw=0)
     ax1.set_yticks([])
     ax1.set_ylabel(f"lead {lead_names[6]}", rotation=0, ha="right", va="center")
-    ax1.set_xlabel("time (s); orange = beats the model attends to as atypical (rollout, darker = more)", fontsize=8)
+    ax1.set_xlabel("time (s); shading = rollout attention per beat (darker = more attention)", fontsize=8)
     axb = fig.add_subplot(gs[2])
-    axb.bar(np.arange(1, len(peaks) + 1), rz, color=["#eb6834" if v > 1 else "#b3b2ae" for v in rz])
-    axb.axhline(1, color="#6b6a66", lw=0.8, ls="--")
+    axb.bar(np.arange(1, len(peaks) + 1), rz, color=["#eb6834" if v > z_flag else "#b3b2ae" for v in rz])
+    axb.axhline(z_flag, color="#6b6a66", lw=0.8, ls="--")
     axb.set_ylabel("rollout\n(z-score)", fontsize=8)
     axb.set_xticks(range(1, len(peaks) + 1))
     axb.tick_params(labelsize=7)
-    axb.set_title("atypical-beat map: beats with z > 1 are dashed-line outliers", fontsize=8, loc="left")
+    axb.set_title(f"relative attention across beats (rollout z-score); orange = above the dashed line (z > {z_flag}); a flat map means no beat stands out", fontsize=8, loc="left")
     axm = fig.add_subplot(gs[3])
     M = np.array([occ[i] for i in ids])
-    im = axm.imshow(M, aspect="auto", cmap="magma")
+    im = axm.imshow(M, aspect="auto", cmap="magma", vmin=0, vmax=max(vmax_min, float(M.max())))
     axm.set_xticks(range(len(peaks)))
     axm.set_xticklabels(range(1, len(peaks) + 1))
     axm.set_yticks(range(n))
     axm.set_yticklabels([textwrap.shorten(texts[i], 46, placeholder="...") + f"  ({scores[i]:.2f})" for i in ids], fontsize=7)
-    axm.set_title("occlusion: drop in each observation's target when that beat is removed (brighter = bigger drop)", fontsize=8, loc="left")
+    axm.set_title("occlusion: drop in each observation's target when that beat is removed (shared scale, 0 to at least 0.15: dark = negligible)", fontsize=8, loc="left")
     for a in range(M.shape[0]):
         for b in range(M.shape[1]):
             axm.text(b, a, f"{M[a, b]:.2f}", ha="center", va="center", fontsize=6, color="white")
@@ -132,20 +132,20 @@ def run_one(C, ecg_row, args, out):
     scores = {i: probs[i] for i in ids}
     roll = sc["rollout"][ids[0]]
     rz = (roll - roll.mean()) / (roll.std() + 1e-9)
-    flagged = [int(j + 1) for j in np.flatnonzero(rz > 1)]
+    flagged = [int(j + 1) for j in np.flatnonzero(rz > args.z_flag)]
     sentences = [beat_sentence(texts[i], scores[i], sc["occlusion"][i], pk, min_drop=args.min_drop) for i in ids]
     lead_names = Z.LEAD_NAMES_ZETA if C.swap else Z.LEAD_NAMES
     labels = [c for c in C.label_cols if int(ecg_row.get(c, 0)) == 1] if hasattr(ecg_row, "get") else []
     title = (f"ECG {ecg_id} | ZETA's top conditions: " + ", ".join(f"{c} {s:.2f}" for c, s in ranked[:3])
              + f" | explained: {cond}" + (f" | dataset labels: {', '.join(labels)}" if labels else ""))
     png = out / f"ecg_{ecg_id}.png"
-    make_figure(x, pk, C.pre, C.post, roll, {i: sc["occlusion"][i] for i in ids}, texts, scores, title, png, lead_names)
+    make_figure(x, pk, C.pre, C.post, roll, {i: sc["occlusion"][i] for i in ids}, texts, scores, title, png, lead_names, args.z_flag)
     md = [f"# ECG {ecg_id}", "",
           "**Prediction (ZETA zero-shot):** " + ", ".join(f"{c} ({s:.2f})" for c, s in ranked[:3]),
           f"**Explained condition:** {cond}" + (f"  \n**Dataset labels:** {', '.join(labels)}" if labels else ""), "",
           "## Cited observations and the beats behind them", ""] + [f"- {s}" for s in sentences] + [
-          "", f"**Beats the model attends to as atypical (rollout, z > 1):** "
-          + (", ".join(f"beat {j} ({pk[j - 1] / FS:.1f} s)" for j in flagged) if flagged else "none stand out"), "",
+          "", f"**Beats with the highest attention (rollout z > {args.z_flag}):** "
+          + (", ".join(f"beat {j} ({pk[j - 1] / FS:.1f} s)" for j in flagged) if flagged else "none stand out (attention is spread evenly across beats)"), "",
           f"**Detected beats:** {len(pk)}", "", f"_{CAVEAT}_", "", f"![figure](ecg_{ecg_id}.png)"]
     (out / f"ecg_{ecg_id}.md").write_text("\n".join(md))
     (out / f"ecg_{ecg_id}.json").write_text(json.dumps(B.clean({
@@ -169,6 +169,7 @@ def main(argv=None):
     p.add_argument("--n", type=int, default=3)
     p.add_argument("--n-obs", type=int, default=3, help="observations shown per ECG")
     p.add_argument("--skip", nargs="*", default=["NORM", "SR"])
+    p.add_argument("--z-flag", type=float, default=1.5, help="rollout z-score above which a beat is called out")
     p.add_argument("--min-drop", type=float, default=0.05, help="smallest occlusion drop (target logit units) worth naming a beat for")
     args = p.parse_args(argv)
     C = BO.Ctx(args)
