@@ -304,6 +304,16 @@ def cmd_run(args, parser):
                 if not args.no_specificity and len(obs_ids) > 1:
                     spec = Z.observation_specificity(branch, x, all_maps, idx, b["pv"], b["nv"],
                                                      SPEC_METHODS, args.target, args.n_steps)
+                within = None
+                if qrs_mask is not None and not args.no_within_qrs:
+                    wm = {k: v for k, v in maps.items() if k not in ("qrs_oracle", "pwave_window", "twave_window")}
+                    w = Z.faithfulness_within(branch, x, wm, qrs_mask, b["pv"][idx], b["nv"][idx], args.target,
+                                              args.n_steps, args.n_random, seed=args.seed)
+                    if w is not None:
+                        within = {"range": w["_full"] - w["_end"], "n_frames": w["_n_frames"],
+                                  "methods": {k: {"del_adv": w["random"]["del_auc"] - v["del_auc"],
+                                                  "ins_adv": v["ins_auc"] - w["random"]["ins_auc"]}
+                                              for k, v in w.items() if not k.startswith("_") and k != "random"}}
                 lead = None
                 if not args.no_lead_attr:
                     lead = Z.lead_attribution(branch, x, b["pv"][idx], b["nv"][idx], args.target,
@@ -317,7 +327,7 @@ def cmd_run(args, parser):
                        "qrs_frac": float(qrs_mask.mean()) if qrs_mask is not None else None,
                        "random": {"del_auc": ev["random"]["del_auc"], "ins_auc": ev["random"]["ins_auc"]},
                        "methods": row_metrics(maps, ev, qrs_mask, xsim), "agree": method_agreement(maps),
-                       "lead_swap": args.lead_swap, "specificity": spec, "lead": lead}
+                       "lead_swap": args.lead_swap, "specificity": spec, "lead": lead, "within": within}
                 f_res.write(json.dumps(clean(row)) + "\n")
                 f_res.flush()
                 if not args.no_save_maps:
@@ -517,6 +527,43 @@ def cmd_aggregate(args, parser):
             print(SPS)
     else:
         print("\n(no rows with specificity: run without --no-specificity / --no-xobs)")
+
+    # ---- within-QRS: do maps rank frames INSIDE the beats better than a random order inside the same windows?
+    wi = []
+    for r in rows:
+        W = r.get("within")
+        if not W or W["range"] is None or W["range"] < args.min_range:
+            continue
+        for m, v in W["methods"].items():
+            wi.append({"ecg_id": r["ecg_id"], "condition": r["condition"], "method": m,
+                       "w_del_n": v["del_adv"] / W["range"], "w_ins_n": v["ins_adv"] / W["range"]})
+    if wi:
+        WI = pd.DataFrame(wi)
+        e_w = WI.groupby(["ecg_id", "method"])[["w_del_n", "w_ins_n"]].mean().reset_index()
+        out = []
+        for m in [m for m in METHODS + ["qrs_center"] if m in set(e_w["method"])]:
+            e = e_w[e_w["method"] == m]
+            row_ = {"method": m, "n_ecg": len(e)}
+            for c in ("w_del_n", "w_ins_n"):
+                lo, hi = boot_ci(e[c])
+                try:
+                    pv_ = float(wilcoxon(e[c]).pvalue)
+                except ValueError:
+                    pv_ = float("nan")
+                row_.update({c: float(e[c].mean()), c + "_lo": lo, c + "_hi": hi,
+                             c.replace("_n", "_win_rate"): float((e[c] > 0).mean()), c.replace("_n", "_p"): pv_})
+            out.append(row_)
+        WS = pd.DataFrame(out).set_index("method")
+        WS.to_csv(d / "within_qrs.csv")
+        by_c_w = WI.groupby(["condition", "method"])[["w_del_n", "w_ins_n"]].mean()
+        by_c_w.to_csv(d / "within_qrs_by_condition.csv")
+        with pd.option_context("display.width", 220, "display.max_columns", None, "display.float_format", "{:.3f}".format):
+            print("\nWITHIN-QRS test: advantage over a random order inside the same QRS windows (normalised by "
+                  "full - all-QRS-filled; >0 = ranks frames inside beats better than chance)")
+            print(WS[[c for c in ["n_ecg", "w_del_n", "w_del_n_lo", "w_del_n_hi", "w_ins_n", "w_ins_n_lo", "w_ins_n_hi",
+                                  "w_del_win_rate", "w_del_p", "w_ins_p"] if c in WS]])
+    else:
+        print("\n(no rows with the within-QRS test: run without --no-within-qrs, or too few beats / too little range)")
 
     # ---- per-lead dependence
     ld = []
@@ -866,6 +913,8 @@ def build_parser():
                    help="only the qrs_oracle reference (skip qrs_center, pwave_window, twave_window)")
     r.add_argument("--no-specificity", action="store_true",
                    help="skip the own-map vs other-observation-map test (needs the cross-observation maps)")
+    r.add_argument("--no-within-qrs", action="store_true",
+                   help="skip the within-QRS-windows deletion/insertion test (ranking frames inside beats)")
     r.add_argument("--no-lead-attr", action="store_true",
                    help="skip per-lead occlusion (necessity, sufficiency, QRS-only) and gradient x input")
     r.add_argument("--no-xobs", action="store_true", help="skip the all-observations target-dependence check")

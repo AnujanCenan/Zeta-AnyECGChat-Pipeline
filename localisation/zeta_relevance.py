@@ -668,6 +668,58 @@ def lead_attribution(branch, x_np, pos_vec, neg_vec, target="logit_diff", frame_
             "occ_qrs_drop": occ_q, "full": float(ends[0]), "blank": float(ends[1])}
 
 
+def faithfulness_within(branch, x_np, relevance, frame_mask, pos_vec, neg_vec, target="logit_diff",
+                        n_steps=20, n_random=10, seed=0):
+    """Deletion/insertion RESTRICTED to the frames in `frame_mask` (e.g. the detected QRS windows), ranked
+    by each method and compared with a random order INSIDE the same frames. This asks whether a map
+    ranks frames better than chance within the beats, which beat location alone cannot answer.
+    Deletion fills the first k ranked frames; insertion starts with all masked frames filled and
+    restores them in order. Curves are over the fraction of masked frames; the score range to
+    normalise by is full - (all masked frames filled). Same median fill and non-locality caveats as
+    `faithfulness`. Returns None if fewer than 4 masked frames."""
+    dev = next(branch.parameters()).device
+    spf, n_frames_fn = frame_geometry(branch)
+    T = x_np.shape[1]
+    Fn = n_frames_fn(T)
+    cand = np.flatnonzero(np.asarray(frame_mask)[:Fn])
+    nc = len(cand)
+    if nc < 4:
+        return None
+    fill = np.median(x_np, axis=1, keepdims=True)
+    ks = np.unique(np.round(np.linspace(0, nc, n_steps + 1)).astype(int))
+    fracs = ks / nc
+
+    def curves(order_local):
+        frames = cand[order_local]
+        dels, inss = [], []
+        for k in ks:
+            m = np.zeros(T, bool)
+            for f in frames[:k]:
+                m[f * spf:(f + 1) * spf] = True
+            allm = np.zeros(T, bool)
+            for f in cand:
+                allm[f * spf:(f + 1) * spf] = True
+            dels.append(np.where(m[None, :], fill, x_np))
+            inss.append(np.where((allm & ~m)[None, :], fill, x_np))
+        to_t = lambda L: torch.tensor(np.stack(L), dtype=torch.float32, device=dev)
+        return (_batched_target(branch, to_t(dels), pos_vec, neg_vec, target),
+                _batched_target(branch, to_t(inss), pos_vec, neg_vec, target))
+
+    rng = np.random.default_rng(seed)
+    res = {}
+    for name, rel in relevance.items():
+        d, i = curves(np.argsort(-np.asarray(rel)[cand], kind="stable"))
+        res[name] = {"del_auc": _trapz(d, fracs), "ins_auc": _trapz(i, fracs)}
+    rd, ri = [], []
+    for _ in range(n_random):
+        d, i = curves(rng.permutation(nc))
+        rd.append(d); ri.append(i)
+    d, i = np.mean(rd, 0), np.mean(ri, 0)
+    res["random"] = {"del_auc": _trapz(d, fracs), "ins_auc": _trapz(i, fracs)}
+    res["_full"], res["_end"], res["_n_frames"] = float(d[0]), float(d[-1]), int(nc)
+    return res
+
+
 def observation_specificity(branch, x_np, maps_by_obs, a, pos_vecs, neg_vecs, methods,
                             target="logit_diff", n_steps=20):
     """Does a method's map for observation `a` hurt observation a's own score more than the maps for
